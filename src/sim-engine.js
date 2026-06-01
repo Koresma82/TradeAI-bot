@@ -7,6 +7,7 @@ const logger  = require("./logger");
 const fb      = require("./firebase");
 const prices  = require("./prices");
 const stats   = require("./stats");
+const aiSignals = require("./ai-signals");
 const { notify, tg } = require("./telegram");
 
 const uid = () => require("crypto").randomUUID();
@@ -19,9 +20,24 @@ let lastBuyTime   = {};  // cooldown por estratégia/ativo
 let tickCount     = 0;
 let totalInvested = 0;
 let dailyLossHit  = false;
-let appSettings   = { maxEstrategias: 5, rotacaoAtiva: false }; // lido do Firestore
+// Definições lidas do Firestore (a app controla isto)
+let appSettings   = {
+  maxEstrategias: 5,
+  rotacaoAtiva: false,
+  // Automação avançada com IA
+  aiBrain: false,
+  aiBrainConfianca: 78,
+  trailingStop: false,
+  trailingStopPct: 4,
+  aiExitOnFlip: true,
+  stopLossPadrao: 6,
+  takeProfitPadrao: 12,
+  valorFixo: 100,
+};
 let simBalance    = parseFloat(process.env.SIM_CAPITAL || "1000");
 let simCapital    = simBalance;
+// Ativos negociáveis (o cérebro AI só compra estes)
+const TRADEABLE = new Set(["btc","eth","wti","gold","silver","spy","qqq","gld","eurusd","gbpusd"]);
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 const sign = v => v >= 0 ? "+" : "−";
@@ -39,21 +55,50 @@ function getRecentHigh(assetId) {
   return pts.length ? Math.max(...pts.map(p => p.price)) : null;
 }
 
-// ── Verificar SL/TP ───────────────────────────────────────────────────────────
+// ── Gerir posições abertas: trailing stop, flip da IA, SL/TP ──────────────────
 async function checkSLTP(currentPrices) {
+  const trailingOn = !!appSettings.trailingStop;
+  const trailPct   = appSettings.trailingStopPct || 4;
+  const exitOnFlip = appSettings.aiExitOnFlip !== false;
+  const flipConf   = appSettings.aiBrainConfianca || 78;
+
   for (const [posId, pos] of Object.entries(openPositions)) {
     const price = currentPrices[pos.assetId]?.price;
     if (!price) continue;
 
+    // ── Trailing stop: sobe o SL atrás do pico quando há lucro ──
+    if (trailingOn) {
+      const peak = Math.max(pos.peak || pos.entryPrice, price);
+      pos.peak = peak;
+      if (peak > pos.entryPrice) {
+        const trailSl = +(peak * (1 - trailPct / 100)).toFixed(pos.assetId === "eurusd" ? 5 : 4);
+        if (trailSl > pos.sl) {
+          pos.sl = trailSl;
+          // persiste o novo SL para a app ver
+          fb.updateTrade("server", posId, { sl: trailSl, peak }).catch(() => {});
+        }
+      }
+    }
+
     let reason = null;
     let closePrice = price;
 
-    if (price <= pos.sl) { reason = "SL"; closePrice = pos.sl; }
-    if (price >= pos.tp) { reason = "TP"; closePrice = pos.tp; }
+    // ── Saída antecipada se a IA virar para VENDER com confiança ──
+    const sg = aiSignals.getSignal(pos.assetId);
+    if (exitOnFlip && sg && sg.sinal === "VENDER" && (sg.confianca || 0) >= flipConf && price > pos.sl) {
+      reason = "AI-EXIT"; closePrice = price;
+    }
+    else if (price <= pos.sl) {
+      reason = (trailingOn && pos.sl > pos.entryPrice) ? "TRAIL" : "SL";
+      closePrice = pos.sl;
+    }
+    else if (price >= pos.tp) { reason = "TP"; closePrice = pos.tp; }
+
     if (!reason) continue;
 
     const pnl = (closePrice - pos.entryPrice) * pos.units;
-    logger.info(`${reason === "TP" ? "✅" : "🛑"} ${reason} ${pos.assetSym} | P&L ${sign(pnl)}${eur(pnl)}`);
+    const icon = pnl >= 0 ? "✅" : "🛑";
+    logger.info(`${icon} ${reason} ${pos.assetSym} | P&L ${sign(pnl)}${eur(pnl)}`);
 
     const closedTrade = {
       ...pos,
@@ -138,6 +183,7 @@ async function executeBuy(strategy, assetId, price) {
     entryPrice:  price,
     units,
     amount,
+    peak:        price,
     sl, tp,
     strategy:    strategy.nome,
     stratId:     strategy.id,
@@ -158,12 +204,66 @@ async function executeBuy(strategy, assetId, price) {
   logger.info(`BUY SIM ${assetId} | €${amount} | @$${price} | SL $${sl} | TP $${tp}`);
 }
 
+// ── Cérebro AI: abre posições com base nos sinais de alta confiança ───────────
+const aiBrainCooldown = {}; // { assetId: ts }
+async function runAiBrain(currentPrices) {
+  if (!appSettings.aiBrain || dailyLossHit) return;
+  const minConf  = appSettings.aiBrainConfianca || 78;
+  const maxStrat = appSettings.maxEstrategias || 5;
+  const perTrade = Math.min(appSettings.valorFixo || 100, parseFloat(process.env.MAX_POSITION_EUR || "500"));
+  const slPct    = appSettings.stopLossPadrao || 6;
+  const tpPct    = appSettings.takeProfitPadrao || 12;
+
+  const sigs = aiSignals.getSignals();
+  for (const sg of Object.values(sigs)) {
+    if (!sg || sg.sinal !== "COMPRAR" || (sg.confianca || 0) < minConf) continue;
+    if (!TRADEABLE.has(sg.id)) continue;
+    const pd = currentPrices[sg.id];
+    if (!pd?.price) continue;
+
+    // cooldown 5 min por ativo
+    if (Date.now() - (aiBrainCooldown[sg.id] || 0) < 5 * 60 * 1000) continue;
+    // não duplicar posição AI no mesmo ativo
+    if (Object.values(openPositions).some(p => p.assetId === sg.id && p.stratId === "ai-brain")) continue;
+    // limites
+    const brainPositions = Object.values(openPositions).filter(p => p.stratId === "ai-brain");
+    const allStratPos = Object.values(openPositions).filter(p => p.stratId !== "manual" && p.stratId !== "daytrading");
+    if (allStratPos.length >= maxStrat) continue;
+    if (simBalance < perTrade) continue;
+    if (totalInvested + perTrade > parseFloat(process.env.MAX_TOTAL_EUR || simCapital)) continue;
+
+    const price = pd.price;
+    const units = +(perTrade / price).toFixed(7);
+    const sl    = +(price * (1 - slPct / 100)).toFixed(sg.id === "eurusd" ? 5 : 4);
+    const tp    = +(price * (1 + tpPct / 100)).toFixed(sg.id === "eurusd" ? 5 : 4);
+    const posId = `aibrain_${Date.now()}_${sg.id}`;
+    const position = {
+      id: posId, assetId: sg.id, assetName: sg.id, assetSym: sg.id.toUpperCase(),
+      entryPrice: price, units, amount: perTrade, peak: price, sl, tp,
+      strategy: `🤖 AI Brain (${sg.confianca}%)`, stratId: "ai-brain",
+      openedAt: new Date().toLocaleTimeString("pt-PT"), status: "ABERTA", mode: "sim",
+    };
+    openPositions[posId] = position;
+    totalInvested += perTrade;
+    simBalance = +(simBalance - perTrade).toFixed(2);
+    aiBrainCooldown[sg.id] = Date.now();
+
+    await fb.saveTrade("server", position);
+    await fb.saveBalance("server", simBalance);
+    await notify(tg.tradeOpen(position, "demo"));
+    logger.info(`🤖 AI BRAIN BUY ${sg.id} | €${perTrade} @$${price} | confiança ${sg.confianca}%`);
+  }
+}
+
 // ── Tick principal ────────────────────────────────────────────────────────────
 async function tick() {
   try {
     // 1. Refresh preços
     await prices.refreshAll();
     const currentPrices = prices.getAll();
+
+    // Atualizar sinais AI (respeita intervalo interno de 5 min)
+    await aiSignals.refresh();
 
     // Registar histórico
     Object.entries(currentPrices).forEach(([id, d]) => {
@@ -200,6 +300,9 @@ async function tick() {
       }
     }
 
+    // 3c. Cérebro AI autónomo — entra com base nos sinais de alta confiança
+    await runAiBrain(currentPrices);
+
     // 3b. Log de diagnóstico (a cada 10 ticks) — mostra estado dos sinais
     tickCount++;
     if (tickCount % 10 === 0 && strategies.length > 0) {
@@ -232,6 +335,18 @@ async function tick() {
       lastTick:      new Date().toISOString(),
     });
 
+    // 5. Heartbeat — a app usa isto para saber que o bot está vivo e desligar o seu próprio motor
+    await fb.saveSetting("server", "botStatus", {
+      alive:    true,
+      mode:     "sim",
+      lastSeen: Date.now(),
+      features: {
+        aiBrain:      !!appSettings.aiBrain,
+        trailingStop: !!appSettings.trailingStop,
+        aiExitOnFlip: appSettings.aiExitOnFlip !== false,
+      },
+    });
+
   } catch (err) {
     logger.error(`SimEngine tick erro: ${err.message}`);
     await fb.logError("sim-engine-tick", err).catch(() => {});
@@ -262,14 +377,22 @@ async function init() {
     logger.info(`Estratégias: ${strategies.map(s => s.nome).join(", ") || "nenhuma"}`);
   });
 
-  // Subscrever definições da app (limites + rotação)
+  // Subscrever definições da app (limites, rotação, automação AI)
   fb.watchSetting("settings", (val) => {
     if (val && typeof val === "object") {
       appSettings = {
-        maxEstrategias: val.maxEstrategias ?? 5,
-        rotacaoAtiva:   val.rotacaoAtiva ?? false,
+        maxEstrategias:   val.maxEstrategias ?? 5,
+        rotacaoAtiva:     val.rotacaoAtiva ?? false,
+        aiBrain:          val.aiBrain ?? false,
+        aiBrainConfianca: val.aiBrainConfianca ?? 78,
+        trailingStop:     val.trailingStop ?? false,
+        trailingStopPct:  val.trailingStopPct ?? 4,
+        aiExitOnFlip:     val.aiExitOnFlip ?? true,
+        stopLossPadrao:   val.stopLossPadrao ?? 6,
+        takeProfitPadrao: val.takeProfitPadrao ?? 12,
+        valorFixo:        val.valorFixo ?? 100,
       };
-      logger.info(`Definições: máx estratégias ${appSettings.maxEstrategias} | rotação ${appSettings.rotacaoAtiva ? "ON" : "OFF"}`);
+      logger.info(`Definições: máx ${appSettings.maxEstrategias} | rotação ${appSettings.rotacaoAtiva ? "ON" : "OFF"} | AI Brain ${appSettings.aiBrain ? `ON@${appSettings.aiBrainConfianca}%` : "OFF"} | Trailing ${appSettings.trailingStop ? `ON@${appSettings.trailingStopPct}%` : "OFF"}`);
     }
   });
 
