@@ -15,6 +15,8 @@ const uid = () => require("crypto").randomUUID();
 let strategies    = [];
 let openPositions = {};  // { posId: { ...position } }
 let priceHistory  = {};  // { assetId: [{ price, ts }] }
+let lastBuyTime   = {};  // cooldown por estratégia/ativo
+let tickCount     = 0;
 let totalInvested = 0;
 let dailyLossHit  = false;
 let appSettings   = { maxEstrategias: 5, rotacaoAtiva: false }; // lido do Firestore
@@ -179,22 +181,42 @@ async function tick() {
           const priceData = currentPrices[assetId];
           if (!priceData?.price) continue;
 
-          // Verificar se já tem posição aberta neste ativo/estratégia
-          const alreadyOpen = Object.values(openPositions).some(
-            p => p.assetId === assetId && p.stratId === strategy.id
-          );
-          if (alreadyOpen) continue;
+          // Cooldown: não comprar o mesmo ativo/estratégia mais que 1x por 2 min
+          const cdKey = `${strategy.id}_${assetId}`;
+          const lastBuy = lastBuyTime[cdKey] || 0;
+          if (Date.now() - lastBuy < 120000) continue;
 
           // Verificar sinal: queda do máximo recente
           const high = getRecentHigh(assetId);
           if (!high) continue;
           const dropPct = ((high - priceData.price) / high) * 100;
           if (dropPct >= strategy.compra) {
-            logger.info(`🎯 Sinal: ${strategy.nome} → ${assetId} (queda ${dropPct.toFixed(2)}%)`);
+            logger.info(`🎯 Sinal: ${strategy.nome} → ${assetId} (queda ${dropPct.toFixed(2)}% ≥ ${strategy.compra}%)`);
+            const before = Object.keys(openPositions).length;
             await executeBuy(strategy, assetId, priceData.price);
+            if (Object.keys(openPositions).length > before) lastBuyTime[cdKey] = Date.now();
           }
         }
       }
+    }
+
+    // 3b. Log de diagnóstico (a cada 10 ticks) — mostra estado dos sinais
+    tickCount++;
+    if (tickCount % 10 === 0 && strategies.length > 0) {
+      const diags = [];
+      for (const strategy of strategies) {
+        if (!strategy.ativo) continue;
+        for (const assetId of (strategy.ativos || [])) {
+          const pd = currentPrices[assetId];
+          const high = getRecentHigh(assetId);
+          if (pd?.price && high) {
+            const drop = ((high - pd.price) / high) * 100;
+            diags.push(`${assetId}: queda ${drop.toFixed(2)}%/${strategy.compra}%`);
+          }
+        }
+      }
+      const open = Object.keys(openPositions).length;
+      logger.info(`📊 Estado: ${open} posições abertas | ${diags.join(" · ") || "a recolher preços"}`);
     }
 
     // 4. Atualizar P&L não realizado no Firestore (a cada tick)
