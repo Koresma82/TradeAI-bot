@@ -1,0 +1,21 @@
+{
+  "name": "tradeai-bot",
+  "version": "1.0.0",
+  "description": "TradeAI — Bot IBKR Node.js (demo + real)",
+  "main": "src/index.js",
+  "scripts": {
+    "start":      "node src/index.js",
+    "start:demo": "MODE=demo node src/index.js",
+    "start:real": "MODE=real node src/index.js",
+    "pm2:demo":   "pm2 start src/index.js --name tradeai-demo --env demo",
+    "pm2:real":   "pm2 start src/index.js --name tradeai-real --env production"
+  },
+  "dependencies": {
+    "@stoqey/ib":    "^1.0.44",
+    "firebase-admin": "^12.2.0",
+    "node-cron":     "^3.0.3",
+    "node-telegram-bot-api": "^0.66.0",
+    "dotenv":        "^16.4.5",
+    "winston":       "^3.13.0"
+  }
+}

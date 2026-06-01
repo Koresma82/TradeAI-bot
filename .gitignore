@@ -1,0 +1,6 @@
+node_modules/
+logs/
+.env
+config/firebase-admin.json
+*.log
+.DS_Store
