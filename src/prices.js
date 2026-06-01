@@ -30,12 +30,28 @@ let priceCache  = {};
 let prevPrices  = {};
 let initialized = false;
 
-// ── CoinGecko (crypto) ──────────────────────────────────────────────────────
+// ── CoinGecko (crypto) — com cache para evitar 429 ──────────────────────────
+let lastCgFetch = 0;
+const CG_MIN_INTERVAL = 60000; // mínimo 60s entre pedidos ao CoinGecko (free tier)
+
 async function fetchCoinGecko() {
+  const now = Date.now();
+  // Respeitar rate limit — só busca se passaram 60s desde o último
+  if (now - lastCgFetch < CG_MIN_INTERVAL) {
+    return; // mantém os preços em cache, não falha
+  }
+  lastCgFetch = now;
+
   const cgAssets = ASSETS.filter(a => a.cg);
   const ids      = cgAssets.map(a => a.cg).join(",");
   const url      = `https://api.coingecko.com/api/v3/simple/price?ids=${ids}&vs_currencies=usd&include_24hr_change=true`;
   const r = await fetch(url, { headers: { "Accept": "application/json" } });
+  if (r.status === 429) {
+    // Rate limited — recua e tenta mais tarde, mantém cache
+    lastCgFetch = now + 60000; // espera mais 60s extra
+    logger.warn("CoinGecko 429 — a usar cache, retry em 2min");
+    return;
+  }
   if (!r.ok) throw new Error(`CoinGecko ${r.status}`);
   const data = await r.json();
   cgAssets.forEach(a => {
