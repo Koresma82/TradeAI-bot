@@ -1,63 +1,93 @@
 // src/firebase.js
 // Lê estratégias e escreve trades/stats no Firestore
+// Dados partilhados com a app React em: users/{uid}/...
 
 const admin  = require("firebase-admin");
 const path   = require("path");
+const fs     = require("fs");
 const logger = require("./logger");
 
 let db;
 
+// O UID do utilizador autorizado (mesmo da app React).
+// Definido via env USER_UID — obtém-se na app (DevTools → Application → IndexedDB → firebase)
+// ou usa "server" como fallback partilhado.
+const USER_UID = process.env.USER_UID || "server";
+
 function initFirebase() {
-  const serviceAccount = require(path.join(__dirname, "../config/firebase-admin.json"));
+  let serviceAccount;
+
+  // Opção 1: credencial via variável de ambiente (Railway/Hetzner)
+  if (process.env.FIREBASE_ADMIN_JSON) {
+    try {
+      serviceAccount = JSON.parse(process.env.FIREBASE_ADMIN_JSON);
+      logger.info("Firebase: credencial lida de FIREBASE_ADMIN_JSON ✓");
+    } catch (e) {
+      throw new Error("FIREBASE_ADMIN_JSON inválido — verifica que colaste o JSON completo");
+    }
+  }
+  // Opção 2: ficheiro local (desenvolvimento)
+  else {
+    const filePath = path.join(__dirname, "../config/firebase-admin.json");
+    if (fs.existsSync(filePath)) {
+      serviceAccount = require(filePath);
+      logger.info("Firebase: credencial lida de config/firebase-admin.json ✓");
+    } else {
+      throw new Error("Sem credencial Firebase — define FIREBASE_ADMIN_JSON ou coloca config/firebase-admin.json");
+    }
+  }
+
   admin.initializeApp({
     credential: admin.credential.cert(serviceAccount),
     projectId:  process.env.FIREBASE_PROJECT_ID || "tradeaisimulator-aebcd",
   });
   db = admin.firestore();
-  logger.info("Firebase Admin inicializado ✓");
+  logger.info(`Firebase Admin inicializado ✓ (uid: ${USER_UID})`);
 }
 
-// ── Ler estratégias activas ───────────────────────────────────────────────────
-async function getActiveStrategies() {
-  const snap = await db
-    .collection("strategies")
-    .where("ativo", "==", true)
-    .get();
-  return snap.docs.map(d => ({ id: d.id, ...d.data() }));
-}
+// Helpers para caminhos sob users/{uid}/...
+const userCol = (col) => db.collection("users").doc(USER_UID).collection(col);
+const userDoc = (col, id) => userCol(col).doc(id);
 
-// ── Subscrever estratégias (live updates) ────────────────────────────────────
+// ── Subscrever estratégias activas ────────────────────────────────────────────
 function watchStrategies(callback) {
-  return db
-    .collection("strategies")
+  return userCol("strategies")
     .where("ativo", "==", true)
     .onSnapshot(snap => {
       const strats = snap.docs.map(d => ({ id: d.id, ...d.data() }));
       logger.info(`Estratégias activas: ${strats.length}`);
       callback(strats);
-    });
+    }, err => logger.error(`watchStrategies erro: ${err.message}`));
 }
 
 // ── Guardar trade ─────────────────────────────────────────────────────────────
-async function saveTrade(trade) {
-  await db.collection("trades").doc(trade.id).set({
+async function saveTrade(uid, trade) {
+  await userDoc("trades", trade.id).set({
     ...trade,
     savedAt: admin.firestore.FieldValue.serverTimestamp(),
   });
 }
 
 // ── Actualizar trade (fechar posição) ────────────────────────────────────────
-async function updateTrade(id, updates) {
-  await db.collection("trades").doc(id).update({
+async function updateTrade(uid, id, updates) {
+  await userDoc("trades", id).set({
     ...updates,
+    updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+  }, { merge: true });
+}
+
+// ── Guardar setting (P&L ao vivo, saldo, etc.) ───────────────────────────────
+async function saveSetting(uid, key, value) {
+  await userDoc("settings", key).set({
+    value,
     updatedAt: admin.firestore.FieldValue.serverTimestamp(),
   });
 }
 
 // ── Guardar snapshot de stats diárias ────────────────────────────────────────
-async function saveStats(stats) {
+async function saveStats(uid, stats) {
   const day = new Date().toISOString().split("T")[0];
-  await db.collection("stats").doc(day).set({
+  await userDoc("stats", day).set({
     ...stats,
     savedAt: admin.firestore.FieldValue.serverTimestamp(),
   });
@@ -65,14 +95,14 @@ async function saveStats(stats) {
 }
 
 // ── Ler saldo actual guardado ─────────────────────────────────────────────────
-async function getBalance() {
-  const snap = await db.collection("settings").doc("balance").get();
+async function getBalance(uid) {
+  const snap = await userDoc("settings", "simBalance").get();
   return snap.exists ? snap.data().value : null;
 }
 
 // ── Actualizar saldo ──────────────────────────────────────────────────────────
-async function saveBalance(value) {
-  await db.collection("settings").doc("balance").set({
+async function saveBalance(uid, value) {
+  await userDoc("settings", "simBalance").set({
     value,
     updatedAt: admin.firestore.FieldValue.serverTimestamp(),
   });
@@ -80,22 +110,25 @@ async function saveBalance(value) {
 
 // ── Guardar log de erro ───────────────────────────────────────────────────────
 async function logError(context, error) {
-  await db.collection("errors").add({
-    context,
-    message: error?.message || String(error),
-    stack:   error?.stack   || "",
-    ts:      admin.firestore.FieldValue.serverTimestamp(),
-  });
+  try {
+    await userCol("errors").add({
+      context,
+      message: error?.message || String(error),
+      stack:   error?.stack   || "",
+      ts:      admin.firestore.FieldValue.serverTimestamp(),
+    });
+  } catch (e) { /* silencioso */ }
 }
 
 module.exports = {
   initFirebase,
   watchStrategies,
-  getActiveStrategies,
   saveTrade,
   updateTrade,
+  saveSetting,
   saveStats,
   getBalance,
   saveBalance,
   logError,
+  USER_UID,
 };
