@@ -17,6 +17,7 @@ let openPositions = {};  // { posId: { ...position } }
 let priceHistory  = {};  // { assetId: [{ price, ts }] }
 let totalInvested = 0;
 let dailyLossHit  = false;
+let appSettings   = { maxEstrategias: 5, rotacaoAtiva: false }; // lido do Firestore
 let simBalance    = parseFloat(process.env.SIM_CAPITAL || "1000");
 let simCapital    = simBalance;
 
@@ -88,6 +89,39 @@ async function executeBuy(strategy, assetId, price) {
     return;
   }
   if (dailyLossHit) { logger.warn("Limite perda diária atingido — bloqueado"); return; }
+
+  // Limite de posições de estratégia (por tipo)
+  const maxStrat = appSettings.maxEstrategias || 5;
+  const stratPositions = Object.values(openPositions).filter(
+    p => p.stratId !== "manual" && p.stratId !== "daytrading"
+  );
+  if (stratPositions.length >= maxStrat) {
+    if (!appSettings.rotacaoAtiva) {
+      // Limite cheio, rotação desligada → não compra
+      return;
+    }
+    // ── ROTAÇÃO: vender a posição com mais lucro para abrir esta ──
+    let bestWinner = null, bestPnl = -Infinity;
+    for (const pos of stratPositions) {
+      const cur = prices.getPrice(pos.assetId);
+      if (!cur) continue;
+      const pnl = (cur - pos.entryPrice) * pos.units;
+      if (pnl > bestPnl) { bestPnl = pnl; bestWinner = pos; }
+    }
+    // Só roda se a melhor posição estiver em lucro
+    if (!bestWinner || bestPnl <= 0) {
+      return; // nenhuma em lucro para sacrificar
+    }
+    // Fechar o vencedor
+    const cur = prices.getPrice(bestWinner.assetId);
+    delete openPositions[bestWinner.id];
+    totalInvested = Math.max(0, totalInvested - bestWinner.amount);
+    simBalance = +(simBalance + bestWinner.amount + bestPnl).toFixed(2);
+    await fb.updateTrade("server", bestWinner.id, { status: "ROTACAO", closePrice: cur, pnl: bestPnl, closedAt: new Date().toLocaleTimeString("pt-PT") });
+    await fb.saveBalance("server", simBalance);
+    stats.addClosedTrade({ ...bestWinner, status: "ROTACAO", closePrice: cur, pnl: bestPnl });
+    logger.info(`🔄 ROTAÇÃO: fechado ${bestWinner.assetSym} (+€${bestPnl.toFixed(2)}) para abrir ${assetId}`);
+  }
 
   const units = +(amount / price).toFixed(7);
   const sl    = +(price * (1 - strategy.sl  / 100)).toFixed(4);
@@ -204,6 +238,17 @@ async function init() {
   fb.watchStrategies(newStrats => {
     strategies = newStrats;
     logger.info(`Estratégias: ${strategies.map(s => s.nome).join(", ") || "nenhuma"}`);
+  });
+
+  // Subscrever definições da app (limites + rotação)
+  fb.watchSetting("settings", (val) => {
+    if (val && typeof val === "object") {
+      appSettings = {
+        maxEstrategias: val.maxEstrategias ?? 5,
+        rotacaoAtiva:   val.rotacaoAtiva ?? false,
+      };
+      logger.info(`Definições: máx estratégias ${appSettings.maxEstrategias} | rotação ${appSettings.rotacaoAtiva ? "ON" : "OFF"}`);
+    }
   });
 
   // Aguardar carga inicial

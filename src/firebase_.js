@@ -115,21 +115,6 @@ async function saveBalance(uid, value) {
   });
 }
 
-// ── Ler uma definição (settings da app) ───────────────────────────────────────
-async function getSetting(uid, key) {
-  try {
-    const snap = await userDoc("settings", key).get();
-    return snap.exists ? snap.data().value : null;
-  } catch { return null; }
-}
-
-// ── Subscrever definições em tempo real ──────────────────────────────────────
-function watchSetting(key, callback) {
-  return userDoc("settings", key).onSnapshot(snap => {
-    if (snap.exists) callback(snap.data().value);
-  }, () => {});
-}
-
 // ── Guardar log de erro ───────────────────────────────────────────────────────
 async function logError(context, error) {
   try {
@@ -152,7 +137,5 @@ module.exports = {
   getBalance,
   saveBalance,
   logError,
-  getSetting,
-  watchSetting,
   USER_UID,
 };
