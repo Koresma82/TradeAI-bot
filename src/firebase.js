@@ -17,6 +17,13 @@ const USER_UID = process.env.USER_UID || "server";
 function initFirebase() {
   let serviceAccount;
 
+  // ── DIAGNÓSTICO ──
+  const raw = process.env.FIREBASE_ADMIN_JSON;
+  logger.info(`[DIAG] FIREBASE_ADMIN_JSON existe? ${raw ? "SIM" : "NÃO"}`);
+  logger.info(`[DIAG] Comprimento: ${raw ? raw.length : 0} caracteres`);
+  if (raw) logger.info(`[DIAG] Começa com: ${raw.slice(0, 30)}`);
+  logger.info(`[DIAG] Todas as env keys: ${Object.keys(process.env).filter(k => k.includes("FIREBASE") || k.includes("MODE") || k.includes("USER") || k.includes("SIM") || k.includes("GROQ")).join(", ")}`);
+
   // Opção 1: credencial via variável de ambiente (Railway/Hetzner)
   if (process.env.FIREBASE_ADMIN_JSON) {
     try {
