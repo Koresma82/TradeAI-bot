@@ -3,6 +3,9 @@
   "version": "1.0.0",
   "description": "TradeAI — Bot IBKR Node.js (demo + real)",
   "main": "src/index.js",
+  "engines": {
+    "node": ">=20"
+  },
   "scripts": {
     "start":      "node src/index.js",
     "start:demo": "MODE=demo node src/index.js",

@@ -2,6 +2,7 @@
 require("dotenv").config();
 
 const cron   = require("node-cron");
+const http   = require("http");
 const logger = require("./logger");
 const fb     = require("./firebase");
 const stats  = require("./stats");
@@ -16,8 +17,29 @@ const BROKER = process.env.BROKER || "alpaca"; // "alpaca" | "ibkr" | "both"
 const logsDir = path.join(__dirname, "../logs");
 if (!fs.existsSync(logsDir)) fs.mkdirSync(logsDir);
 
+// ── Health-check HTTP server ──────────────────────────────────────────────
+// O Railway gosta de ver uma porta aberta. Também serve para confirmares que o
+// bot está vivo abrindo o URL público do serviço.
+function startHealthServer() {
+  const port = process.env.PORT || 3000;
+  http.createServer((req, res) => {
+    const m = stats.getMetrics ? stats.getMetrics() : {};
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({
+      ok:        true,
+      mode:      MODE,
+      broker:    BROKER,
+      uptime_s:  Math.round(process.uptime()),
+      trades:    m.totalTrades ?? null,
+      pnl:       m.totalPnl ?? null,
+      time:      new Date().toISOString(),
+    }));
+  }).listen(port, () => logger.info(`Health server na porta ${port} ✓`));
+}
+
 async function main() {
   try {
+    startHealthServer();
     initTelegram();
     fb.initFirebase();
 

@@ -1,84 +1,44 @@
-# ◆ TradeAI Bot — Servidor 24/7
+# ◆ TradeAI Bot — Servidor 24/7 (Railway)
 
-Corre estratégias de simulação ou trading real sem precisar do browser aberto.
-
----
-
-## 🚀 COMEÇAR — 3 passos
-
-### Passo 1 — Hetzner (servidor €4/mês)
-
-1. Vai a **hetzner.com** → Cloud → Create Server
-2. Escolhe: **CX22** · Ubuntu 24.04 · Frankfurt · €3.79/mês
-3. Cria uma SSH Key ou usa password
-4. Liga-te ao servidor:
-```bash
-ssh root@IP_DO_SERVIDOR
-```
-
-### Passo 2 — Instalar Node.js e PM2
-
-```bash
-# Node.js 20
-curl -fsSL https://deb.nodesource.com/setup_20.x | bash -
-apt install -y nodejs
-
-# PM2 (gestor de processos)
-npm install -g pm2
-
-# Criar pasta
-mkdir /opt/tradeai-bot
-```
-
-### Passo 3 — Copiar o bot e configurar
-
-```bash
-# No teu PC, copia a pasta tradeai-bot para o servidor
-scp -r tradeai-bot/ root@IP_DO_SERVIDOR:/opt/tradeai-bot/
-
-# No servidor
-cd /opt/tradeai-bot
-npm install
-cp .env.example .env
-nano .env   # preenche as variáveis
-```
-
-**Variáveis obrigatórias para modo SIM:**
-```env
-MODE=sim
-SIM_CAPITAL=1000
-FIREBASE_PROJECT_ID=tradeaisimulator-aebcd
-```
-
-**Firebase Admin JSON** (obrigatório):
-- Firebase Console → Project Settings → Service Accounts → Generate new private key
-- Descarrega o JSON e coloca em `/opt/tradeai-bot/config/firebase-admin.json`
+Corre toda a automação (estratégias, cérebro AI, compra/venda) no servidor,
+sem precisar do browser aberto. Deploy no **Railway**.
 
 ---
 
-## ▶ Iniciar o Bot
+## 🚀 Deploy
 
-```bash
-# Modo SIMULAÇÃO 24/7 (começa aqui)
-pm2 start ecosystem.config.js
-pm2 save
-pm2 startup   # auto-start no boot
+O passo-a-passo completo está em **[RAILWAY.md](./RAILWAY.md)**. Resumo:
 
-# Ver logs em tempo real
-pm2 logs tradeai-sim
-```
+1. Põe esta pasta no GitHub (`git init` → push). O `.gitignore` protege os segredos.
+2. Railway → **New Project** → **Deploy from GitHub repo** → escolhe o repo.
+3. Em **Variables**, define (no mínimo):
+   ```env
+   MODE=sim
+   USER_UID=<o teu UID — copia na app em Definições → Copiar UID>
+   FIREBASE_ADMIN_JSON=<cola o JSON da Service Account do Firebase>
+   FIREBASE_PROJECT_ID=tradeaisimulator-aebcd
+   GROQ_API_KEY=gsk_...
+   ```
+4. Settings → Networking → **Generate Domain** e abre o URL: deve responder
+   `{"ok":true,...}` (health-check).
+5. Ao fim de ~30s, na app, a barra "Bot 24/7 offline" passa a verde.
+
+> **`USER_UID` é crítico.** O bot escreve em `users/{USER_UID}` e a app lê no teu
+> UID de login. Sem ele, não vês os trades do bot na app.
 
 ---
 
-## 📊 O que faz em modo SIM
+## 📊 O que o bot faz (toda a automação vive aqui)
 
-- Lê estratégias criadas na app React (Firestore)
-- Busca preços reais (CoinGecko + Yahoo Finance) a cada 30s
-- Executa a lógica de compra/venda de acordo com as estratégias
-- Guarda trades e saldo no Firestore
-- A app React mostra os resultados em tempo real
-- Envia relatório diário pelo Telegram (se configurado)
-- Funciona 24/7 mesmo com o computador desligado
+- Lê as estratégias e definições criadas na app (Firestore), em tempo real.
+- Busca preços reais (CoinGecko para cripto + Stooq para o resto) a cada 30s.
+- **Cérebro AI**: gera sinais com a Groq e abre posições de alta confiança.
+- **Estratégias**: compra na queda configurada, gere SL/TP e trailing stop.
+- **Saída por flip da IA**: fecha se a IA virar para VENDER com confiança.
+- Guarda trades, saldo, P&L e heartbeat no Firestore → a app mostra tudo ao vivo.
+- Respeita os limites (máx. por posição, máx. total, perda diária).
+- Relatório diário e alertas pelo Telegram (opcional).
+- Funciona 24/7 mesmo com o computador/app desligados.
 
 ---
 
@@ -86,16 +46,24 @@ pm2 logs tradeai-sim
 
 ```
 MODE=sim   → Simulação 24/7 (sem corretora) — começa aqui
-    ↓ resultados positivos por 15 dias?
+    ↓ resultados positivos por ~15 dias?
 MODE=demo  → Paper Trading Alpaca (preços reais, dinheiro fictício)
     ↓ resultados consistentes?
-MODE=real  → Dinheiro real no Alpaca ou IBKR
+MODE=real  → Dinheiro real (Alpaca / IBKR)
 ```
 
-Para mudar de modo:
+Para mudar de modo no Railway: muda a variável `MODE` e adiciona as chaves da
+corretora (ver RAILWAY.md → "Mudar para trading real"). O Railway reinicia sozinho.
+
+---
+
+## 💻 Correr localmente (opcional, para testar)
+
 ```bash
-nano .env         # altera MODE=sim para MODE=demo
-pm2 restart tradeai-sim
+npm install
+cp .env.example .env   # preenche as variáveis
+# coloca a credencial em config/firebase-admin.json OU usa FIREBASE_ADMIN_JSON
+npm run start:demo     # ou: MODE=sim node src/index.js
 ```
 
 ---
@@ -104,8 +72,8 @@ pm2 restart tradeai-sim
 
 | Item | Custo |
 |------|-------|
-| Hetzner CX22 | €3.79/mês |
+| Railway | Plano gratuito com créditos mensais (este bot é leve e costuma caber) |
 | Firebase (Firestore) | Gratuito (plano Spark) |
-| Yahoo Finance / CoinGecko | Gratuito |
+| CoinGecko / Stooq | Gratuito |
+| Groq | ~€1-2/mês (tem tier gratuito generoso) |
 | Telegram Bot | Gratuito |
-| **Total** | **~€4/mês** |

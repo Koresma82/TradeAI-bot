@@ -50,6 +50,11 @@ function initFirebase() {
   });
   db = admin.firestore();
   logger.info(`Firebase Admin inicializado ✓ (uid: ${USER_UID})`);
+  if (!process.env.USER_UID) {
+    logger.warn("⚠ USER_UID NÃO definido — o bot escreve em users/server.");
+    logger.warn("⚠ A tua app lê no teu UID de login. Define USER_UID (Definições → Copiar UID na app)");
+    logger.warn("⚠ senão NÃO vais ver os trades do bot na app!");
+  }
 }
 
 // Helpers para caminhos sob users/{uid}/...

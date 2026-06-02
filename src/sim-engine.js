@@ -8,6 +8,7 @@ const fb      = require("./firebase");
 const prices  = require("./prices");
 const stats   = require("./stats");
 const aiSignals = require("./ai-signals");
+const dayTrading = require("./day-trading");
 const { notify, tg } = require("./telegram");
 
 const uid = () => require("crypto").randomUUID();
@@ -33,7 +34,9 @@ let appSettings   = {
   stopLossPadrao: 6,
   takeProfitPadrao: 12,
   valorFixo: 100,
+  maxDayTrading: 5,
 };
+let dtConfig = null; // config de day trading lida da app (dtState)
 let simBalance    = parseFloat(process.env.SIM_CAPITAL || "1000");
 let simCapital    = simBalance;
 // Ativos negociáveis (o cérebro AI só compra estes)
@@ -204,7 +207,41 @@ async function executeBuy(strategy, assetId, price) {
   logger.info(`BUY SIM ${assetId} | €${amount} | @$${price} | SL $${sl} | TP $${tp}`);
 }
 
-// ── Cérebro AI: abre posições com base nos sinais de alta confiança ───────────
+// ── Hooks usados pelo módulo de day trading ──────────────────────────────────
+function countDayTrades() {
+  return Object.values(openPositions).filter(p => p.stratId === "daytrading").length;
+}
+function hasOpen(assetId, stratId) {
+  return Object.values(openPositions).some(p => p.assetId === assetId && p.stratId === stratId);
+}
+// Abre uma posição de day trading (já com SL/TP decididos pela IA). Devolve true se abriu.
+async function openDayTrade({ assetId, assetName, assetSym, price, amount, sl, tp, previsao, confianca }) {
+  if (dailyLossHit) return false;
+  const amt = Math.min(amount, parseFloat(process.env.MAX_POSITION_EUR || "500"));
+  if (simBalance < amt) return false;
+  if (totalInvested + amt > parseFloat(process.env.MAX_TOTAL_EUR || simCapital)) return false;
+
+  const units = +(amt / price).toFixed(7);
+  const posId = `daytrade_${Date.now()}_${assetId}`;
+  const position = {
+    id: posId, assetId, assetName, assetSym,
+    entryPrice: price, units, amount: amt, peak: price, sl, tp,
+    strategy: `⚡ DayTrade${confianca ? ` (${confianca}%)` : ""}${previsao ? ` — ${String(previsao).slice(0,40)}` : ""}`,
+    stratId: "daytrading",
+    openedAt: new Date().toLocaleTimeString("pt-PT"), status: "ABERTA", mode: "sim",
+  };
+  openPositions[posId] = position;
+  totalInvested += amt;
+  simBalance = +(simBalance - amt).toFixed(2);
+
+  await fb.saveTrade("server", position);
+  await fb.saveBalance("server", simBalance);
+  await notify(tg.tradeOpen(position, "daytrade")).catch(() => {});
+  logger.info(`⚡ DAYTRADE BUY ${assetId} | €${amt} @$${price} | SL $${sl} | TP $${tp} | conf ${confianca}%`);
+  return true;
+}
+
+
 const aiBrainCooldown = {}; // { assetId: ts }
 async function runAiBrain(currentPrices) {
   if (!appSettings.aiBrain || dailyLossHit) return;
@@ -308,6 +345,11 @@ async function tick() {
     // 3c. Cérebro AI autónomo — entra com base nos sinais de alta confiança
     await runAiBrain(currentPrices);
 
+    // 3d. Day Trading 24/7 — scan com IA e abre posições rápidas (config vinda da app)
+    await dayTrading.run(dtConfig, appSettings.maxDayTrading || 5, {
+      openDayTrade, countDayTrades, hasOpen,
+    }).catch(err => logger.warn(`DayTrading run: ${err.message}`));
+
     // 3b. Log de diagnóstico (a cada 10 ticks) — mostra estado dos sinais
     tickCount++;
     if (tickCount % 10 === 0 && strategies.length > 0) {
@@ -396,11 +438,28 @@ async function init() {
         stopLossPadrao:   val.stopLossPadrao ?? 6,
         takeProfitPadrao: val.takeProfitPadrao ?? 12,
         valorFixo:        val.valorFixo ?? 100,
+        maxDayTrading:    val.maxDayTrading ?? 5,
         aiSignalsMin:     val.aiSignalsMin ?? 15,
       };
       // Aplicar intervalo de sinais AI em tempo real
       aiSignals.setRefreshMinutes(appSettings.aiSignalsMin);
       logger.info(`Definições: máx ${appSettings.maxEstrategias} | rotação ${appSettings.rotacaoAtiva ? "ON" : "OFF"} | AI Brain ${appSettings.aiBrain ? `ON@${appSettings.aiBrainConfianca}%` : "OFF"} | Trailing ${appSettings.trailingStop ? `ON@${appSettings.trailingStopPct}%` : "OFF"} | Sinais ${appSettings.aiSignalsMin}min`);
+    }
+  });
+
+  // Subscrever config de Day Trading (escrita pela app em settings/dtState)
+  fb.watchSetting("dtState", (val) => {
+    if (val && typeof val === "object") {
+      dtConfig = {
+        active:       !!val.active,
+        profitTarget: val.profitTarget ?? 6,
+        maxLoss:      val.maxLoss ?? 3,
+        amount:       val.amount ?? 100,
+        minConf:      val.minConf ?? 75,
+        assets:       Array.isArray(val.assets) ? val.assets : [],
+        dailyPnl:     val.dailyPnl ?? 0,
+      };
+      logger.info(`Day Trading: ${dtConfig.active ? `ON · alvo ${dtConfig.profitTarget}% · SL ${dtConfig.maxLoss}% · €${dtConfig.amount} · conf ${dtConfig.minConf}%` : "OFF"}`);
     }
   });
 
