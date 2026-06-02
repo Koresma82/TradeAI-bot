@@ -250,7 +250,7 @@ async function runAiBrain(currentPrices) {
 
     await fb.saveTrade("server", position);
     await fb.saveBalance("server", simBalance);
-    await notify(tg.aiBrainOpen(position, sg));
+    await notify(tg.tradeOpen(position, "demo"));
     logger.info(`🤖 AI BRAIN BUY ${sg.id} | €${perTrade} @$${price} | confiança ${sg.confianca}%`);
   }
 }
@@ -262,13 +262,8 @@ async function tick() {
     await prices.refreshAll();
     const currentPrices = prices.getAll();
 
-    // Atualizar sinais AI (intervalo configurável) e persistir para a app os mostrar
-    const sigsBefore = JSON.stringify(aiSignals.getSignals());
+    // Atualizar sinais AI (respeita intervalo interno de 5 min)
     await aiSignals.refresh();
-    const sigsAfter = aiSignals.getSignals();
-    if (JSON.stringify(sigsAfter) !== sigsBefore && Object.keys(sigsAfter).length) {
-      fb.saveSetting("server", "marketSignals", sigsAfter).catch(() => {});
-    }
 
     // Registar histórico
     Object.entries(currentPrices).forEach(([id, d]) => {
@@ -396,11 +391,8 @@ async function init() {
         stopLossPadrao:   val.stopLossPadrao ?? 6,
         takeProfitPadrao: val.takeProfitPadrao ?? 12,
         valorFixo:        val.valorFixo ?? 100,
-        aiSignalsMin:     val.aiSignalsMin ?? 15,
       };
-      // Aplicar intervalo de sinais AI em tempo real
-      aiSignals.setRefreshMinutes(appSettings.aiSignalsMin);
-      logger.info(`Definições: máx ${appSettings.maxEstrategias} | rotação ${appSettings.rotacaoAtiva ? "ON" : "OFF"} | AI Brain ${appSettings.aiBrain ? `ON@${appSettings.aiBrainConfianca}%` : "OFF"} | Trailing ${appSettings.trailingStop ? `ON@${appSettings.trailingStopPct}%` : "OFF"} | Sinais ${appSettings.aiSignalsMin}min`);
+      logger.info(`Definições: máx ${appSettings.maxEstrategias} | rotação ${appSettings.rotacaoAtiva ? "ON" : "OFF"} | AI Brain ${appSettings.aiBrain ? `ON@${appSettings.aiBrainConfianca}%` : "OFF"} | Trailing ${appSettings.trailingStop ? `ON@${appSettings.trailingStopPct}%` : "OFF"}`);
     }
   });
 
