@@ -315,7 +315,7 @@ async function runAiBrain(currentPrices) {
 
     await fb.saveTrade("server", position);
     await fb.saveBalance("server", simBalance);
-    await notify(tg.aiBrainOpen(position, sg));
+    await notify(tg.tradeOpen(position, broker.getMode())).catch(() => {});
     logger.info(`🤖 AI BRAIN BUY ${sg.id} | €${perTrade} @$${price} | confiança ${sg.confianca}%`);
   }
 }
@@ -504,9 +504,11 @@ async function init() {
   }
 
   // Recuperar posições abertas do Firestore (sobrevive a restarts/deploys)
+  let recuperadas = 0;
   try {
     const abertas = await fb.loadOpenPositions("server");
     abertas.forEach(p => { openPositions[p.id] = p; });
+    recuperadas = abertas.length;
     if (abertas.length) {
       logger.info(`♻ ${abertas.length} posições abertas recuperadas do Firestore`);
     } else {
@@ -585,6 +587,13 @@ async function init() {
 
   // Primeiro tick imediato
   await tick();
+
+  return {
+    mode:        broker.getMode(),
+    balance:     simBalance,
+    recovered:   recuperadas,
+    tickSeconds: TICK_MS / 1000,
+  };
 }
 
 module.exports = { init };

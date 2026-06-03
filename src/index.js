@@ -6,7 +6,7 @@ const http   = require("http");
 const logger = require("./logger");
 const fb     = require("./firebase");
 const stats  = require("./stats");
-const { initTelegram, notify, tg } = require("./telegram");
+const { initTelegram, notify, testConnection, tg } = require("./telegram");
 const fs     = require("fs");
 const path   = require("path");
 
@@ -41,6 +41,7 @@ async function main() {
   try {
     startHealthServer();
     initTelegram();
+    await testConnection(); // envia mensagem de teste — confirma que o Telegram funciona
     fb.initFirebase();
 
     logger.info(`═══════════════════════════════════`);
@@ -51,8 +52,15 @@ async function main() {
       // ── MODO SIMULAÇÃO 24/7 — não precisa de corretora ──────────────────
       logger.info("Modo SIMULAÇÃO — sem corretora real");
       const simEngine = require("./sim-engine");
-      await simEngine.init();
-      await notify(`🤖 *TradeAI Bot SIM iniciado*\nCapital: €${process.env.SIM_CAPITAL || 1000}\n${new Date().toLocaleString("pt-PT")}`);
+      const r = await simEngine.init();
+      await notify(
+        `🚀 *Deploy concluído — Bot SIM online*\n` +
+        `Modo: Simulação\n` +
+        `Saldo: €${(r?.balance ?? 0).toFixed(2)}\n` +
+        `Posições recuperadas: ${r?.recovered ?? 0}\n` +
+        `Tick: ${r?.tickSeconds ?? 30}s\n` +
+        `${new Date().toLocaleString("pt-PT")}`
+      );
 
     } else if (MODE === "paper" || MODE === "real") {
       // ── MODO PAPER/REAL — motor unificado (AI Brain) + execução Alpaca ───
@@ -60,8 +68,14 @@ async function main() {
       // ordens reais na Alpaca. paper = dinheiro fictício; real = dinheiro real.
       logger.info(`Modo ${MODE.toUpperCase()} — execução via Alpaca`);
       const simEngine = require("./sim-engine");
-      await simEngine.init(); // init() verifica a corretora e aborta se falhar
-      await notify(`🤖 *TradeAI Bot ${MODE.toUpperCase()} iniciado*\nBroker: Alpaca\n${new Date().toLocaleString("pt-PT")}`);
+      const r = await simEngine.init(); // init() verifica a corretora e aborta se falhar
+      await notify(
+        `🚀 *Deploy concluído — Bot ${MODE.toUpperCase()} online*\n` +
+        `Broker: Alpaca (${MODE === "real" ? "💵 DINHEIRO REAL" : "📝 paper"})\n` +
+        `Saldo: €${(r?.balance ?? 0).toFixed(2)}\n` +
+        `Posições recuperadas: ${r?.recovered ?? 0}\n` +
+        `${new Date().toLocaleString("pt-PT")}`
+      );
 
     } else if (MODE === "demo") {
       // ── MODO DEMO antigo (IBKR) — mantido para retrocompatibilidade ──────

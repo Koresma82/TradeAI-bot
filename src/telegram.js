@@ -16,12 +16,30 @@ function initTelegram() {
 
 async function notify(msg) {
   const chatId = process.env.TELEGRAM_CHAT_ID;
-  if (!bot || !chatId) return;
+  if (!bot || !chatId) return false;
   try {
     await bot.sendMessage(chatId, msg, { parse_mode: "Markdown" });
+    return true;
   } catch (e) {
     logger.warn(`Telegram erro: ${e.message}`);
+    return false;
   }
+}
+
+// Teste explícito da ligação ao Telegram — envia uma mensagem e confirma nos logs.
+// Chamado no arranque para validares que o canal funciona.
+async function testConnection() {
+  const token  = process.env.TELEGRAM_TOKEN;
+  const chatId = process.env.TELEGRAM_CHAT_ID;
+  if (!token)  { logger.warn("Telegram: TELEGRAM_TOKEN em falta — teste ignorado"); return false; }
+  if (!chatId) { logger.warn("Telegram: TELEGRAM_CHAT_ID em falta — teste ignorado"); return false; }
+  if (!bot)    { logger.warn("Telegram: bot não inicializado — teste ignorado"); return false; }
+  const ok = await notify(
+    `✅ *Teste de Telegram OK*\nO bot consegue enviar-te mensagens.\n${new Date().toLocaleString("pt-PT")}`
+  );
+  if (ok) logger.info("Telegram: teste enviado com sucesso ✓ (verifica o telemóvel)");
+  else    logger.warn("Telegram: teste FALHOU — verifica TOKEN/CHAT_ID e se já falaste com o bot");
+  return ok;
 }
 
 // Mensagens formatadas
@@ -75,4 +93,4 @@ const tg = {
   },
 };
 
-module.exports = { initTelegram, notify, tg };
+module.exports = { initTelegram, notify, testConnection, tg };
