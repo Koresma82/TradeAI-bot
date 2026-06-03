@@ -21,6 +21,13 @@ let lastBuyTime   = {};  // cooldown por estratégia/ativo
 let tickCount     = 0;
 let totalInvested = 0;
 let dailyLossHit  = false;
+// ── Controlo de escritas ao Firestore (poupar quota/custos) ──────────────────
+let lastSimLiveJson    = "";   // último simLive escrito (só reescreve se mudar)
+let lastSimLiveAt      = 0;    // timestamp da última escrita de simLive
+let lastHeartbeatAt    = 0;    // timestamp do último botStatus escrito
+let lastFeaturesJson   = "";   // últimas features escritas no botStatus
+const SIMLIVE_MIN_MS   = 60 * 1000;       // no máx. 1 escrita de simLive por minuto
+const HEARTBEAT_MS     = 2 * 60 * 1000;   // heartbeat a cada 2 min (app exige < 3 min)
 // Definições lidas do Firestore (a app controla isto)
 let appSettings   = {
   maxEstrategias: 5,
@@ -369,30 +376,54 @@ async function tick() {
       logger.info(`📊 Estado: ${open} posições abertas | ${diags.join(" · ") || "a recolher preços"}`);
     }
 
-    // 4. Atualizar P&L não realizado no Firestore (a cada tick)
+    // 4. Atualizar P&L não realizado no Firestore — só quando muda ou 1x/min
     const unrealized = Object.values(openPositions).reduce((s, pos) => {
       const p = currentPrices[pos.assetId]?.price;
       return s + (p ? (p - pos.entryPrice) * pos.units : 0);
     }, 0);
-    await fb.saveSetting("server", "simLive", {
+    const simLive = {
       balance:       simBalance,
       unrealized:    +unrealized.toFixed(2),
       totalInvested: +totalInvested.toFixed(2),
       openPositions: Object.keys(openPositions).length,
-      lastTick:      new Date().toISOString(),
+    };
+    // Compara por valores arredondados: pequenas oscilações de preço não forçam
+    // escrita; só muda de estado real (nova posição, saldo, P&L ao euro) escreve
+    // já. Caso contrário, escreve no máximo 1x por minuto.
+    const simLiveJson = JSON.stringify({
+      b: simLive.balance,
+      u: Math.round(simLive.unrealized),
+      i: Math.round(simLive.totalInvested),
+      o: simLive.openPositions,
     });
+    const now = Date.now();
+    if (simLiveJson !== lastSimLiveJson || now - lastSimLiveAt >= SIMLIVE_MIN_MS) {
+      await fb.saveSetting("server", "simLive", {
+        ...simLive,
+        lastTick: new Date().toISOString(),
+      });
+      lastSimLiveJson = simLiveJson;
+      lastSimLiveAt   = now;
+    }
 
-    // 5. Heartbeat — a app usa isto para saber que o bot está vivo e desligar o seu próprio motor
-    await fb.saveSetting("server", "botStatus", {
-      alive:    true,
-      mode:     "sim",
-      lastSeen: Date.now(),
-      features: {
-        aiBrain:      !!appSettings.aiBrain,
-        trailingStop: !!appSettings.trailingStop,
-        aiExitOnFlip: appSettings.aiExitOnFlip !== false,
-      },
-    });
+    // 5. Heartbeat — a app usa para saber que o bot está vivo (exige < 3 min).
+    //    Escreve a cada 2 min, ou imediatamente se as features mudarem.
+    const features = {
+      aiBrain:      !!appSettings.aiBrain,
+      trailingStop: !!appSettings.trailingStop,
+      aiExitOnFlip: appSettings.aiExitOnFlip !== false,
+    };
+    const featuresJson = JSON.stringify(features);
+    if (featuresJson !== lastFeaturesJson || now - lastHeartbeatAt >= HEARTBEAT_MS) {
+      await fb.saveSetting("server", "botStatus", {
+        alive:    true,
+        mode:     "sim",
+        lastSeen: now,
+        features,
+      });
+      lastHeartbeatAt  = now;
+      lastFeaturesJson = featuresJson;
+    }
 
   } catch (err) {
     logger.error(`SimEngine tick erro: ${err.message}`);
@@ -416,6 +447,19 @@ async function init() {
     simCapital = savedBal; // considera o atual como base se já havia
     stats.setBalance(simBalance);
     logger.info(`Saldo restaurado: €${simBalance}`);
+  }
+
+  // Recuperar posições abertas do Firestore (sobrevive a restarts/deploys)
+  try {
+    const abertas = await fb.loadOpenPositions("server");
+    abertas.forEach(p => { openPositions[p.id] = p; });
+    if (abertas.length) {
+      logger.info(`♻ ${abertas.length} posições abertas recuperadas do Firestore`);
+    } else {
+      logger.info("Nenhuma posição aberta para recuperar");
+    }
+  } catch (e) {
+    logger.error(`Falha a recuperar posições abertas: ${e.message}`);
   }
 
   // Subscrever estratégias em tempo real
@@ -448,6 +492,7 @@ async function init() {
   });
 
   // Subscrever config de Day Trading (escrita pela app em settings/dtState)
+  let lastDtLogged = null; // só loga quando a config relevante muda (evita spam)
   fb.watchSetting("dtState", (val) => {
     if (val && typeof val === "object") {
       dtConfig = {
@@ -459,7 +504,16 @@ async function init() {
         assets:       Array.isArray(val.assets) ? val.assets : [],
         dailyPnl:     val.dailyPnl ?? 0,
       };
-      logger.info(`Day Trading: ${dtConfig.active ? `ON · alvo ${dtConfig.profitTarget}% · SL ${dtConfig.maxLoss}% · €${dtConfig.amount} · conf ${dtConfig.minConf}%` : "OFF"}`);
+      // Assinatura só dos campos de config (ignora dailyPnl/trades, que mudam
+      // a toda a hora e re-disparavam este listener a cada 2s).
+      const sig = JSON.stringify({
+        a: dtConfig.active, p: dtConfig.profitTarget, m: dtConfig.maxLoss,
+        amt: dtConfig.amount, c: dtConfig.minConf, as: dtConfig.assets,
+      });
+      if (sig !== lastDtLogged) {
+        lastDtLogged = sig;
+        logger.info(`Day Trading: ${dtConfig.active ? `ON · alvo ${dtConfig.profitTarget}% · SL ${dtConfig.maxLoss}% · €${dtConfig.amount} · conf ${dtConfig.minConf}%` : "OFF"}`);
+      }
     }
   });
 

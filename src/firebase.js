@@ -80,6 +80,16 @@ async function saveTrade(uid, trade) {
   });
 }
 
+// ── Carregar posições ABERTAS do Firestore (recuperar após restart) ──────────
+// Sem isto, um restart do bot esquece as posições abertas e deixa-as órfãs
+// (sem stop-loss / take-profit a serem aplicados).
+async function loadOpenPositions(uid) {
+  const snap = await userCol("trades").where("status", "==", "ABERTA").get();
+  return snap.docs
+    .map(d => ({ id: d.id, ...d.data() }))
+    .filter(t => t.mode === "sim");
+}
+
 // ── Actualizar trade (fechar posição) ────────────────────────────────────────
 async function updateTrade(uid, id, updates) {
   await userDoc("trades", id).set({
@@ -202,6 +212,7 @@ module.exports = {
   initFirebase,
   watchStrategies,
   saveTrade,
+  loadOpenPositions,
   updateTrade,
   saveSetting,
   saveStats,
