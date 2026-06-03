@@ -54,10 +54,18 @@ async function main() {
       await simEngine.init();
       await notify(`🤖 *TradeAI Bot SIM iniciado*\nCapital: €${process.env.SIM_CAPITAL || 1000}\n${new Date().toLocaleString("pt-PT")}`);
 
-    } else if (MODE === "demo" || MODE === "real") {
-      // ── MODO LIVE/DEMO — usa corretora real ─────────────────────────────
-      let brokerReady = false;
+    } else if (MODE === "paper" || MODE === "real") {
+      // ── MODO PAPER/REAL — motor unificado (AI Brain) + execução Alpaca ───
+      // O mesmo sim-engine que validámos, mas a camada broker.js executa
+      // ordens reais na Alpaca. paper = dinheiro fictício; real = dinheiro real.
+      logger.info(`Modo ${MODE.toUpperCase()} — execução via Alpaca`);
+      const simEngine = require("./sim-engine");
+      await simEngine.init(); // init() verifica a corretora e aborta se falhar
+      await notify(`🤖 *TradeAI Bot ${MODE.toUpperCase()} iniciado*\nBroker: Alpaca\n${new Date().toLocaleString("pt-PT")}`);
 
+    } else if (MODE === "demo") {
+      // ── MODO DEMO antigo (IBKR) — mantido para retrocompatibilidade ──────
+      let brokerReady = false;
       if (BROKER === "alpaca" || BROKER === "both") {
         const alpaca = require("./alpaca");
         if (alpaca.isConnected()) {
@@ -68,26 +76,23 @@ async function main() {
           logger.warn("Alpaca não configurado — verifica ALPACA_API_KEY e ALPACA_SECRET_KEY");
         }
       }
-
       if (BROKER === "ibkr" || BROKER === "both") {
         const ibkr = require("./ibkr");
         await ibkr.connect(MODE);
         logger.info("IBKR conectado ✓");
         brokerReady = true;
       }
-
       if (!brokerReady) throw new Error("Nenhuma corretora configurada — verifica o .env");
-
       const engine = require("./engine");
       await engine.init();
       await notify(`🤖 *TradeAI Bot ${MODE.toUpperCase()} iniciado*\nBroker: ${BROKER}\n${new Date().toLocaleString("pt-PT")}`);
     }
 
     // ── CRON JOBS (comuns a todos os modos) ─────────────────────────────────
-    // Relatório diário às 22h
+    // Guardar stats diárias às 21h (sem notificar — o resumo vai à meia-noite)
     cron.schedule("0 21 * * *", async () => {
-      const m = await stats.dailyReport();
-      logger.info(`📊 Relatório: ${m.totalTrades} trades | WR ${m.winRate?.toFixed(1)}% | P&L €${m.totalPnl?.toFixed(2)}`);
+      const m = await stats.dailyReport(false);
+      logger.info(`📊 Stats guardadas: ${m.totalTrades} trades | WR ${m.winRate?.toFixed(1)}% | P&L €${m.totalPnl?.toFixed(2)}`);
     });
 
     // Heartbeat de hora em hora
@@ -103,7 +108,7 @@ async function main() {
         const r = await fb.archiveClosedTrades();
         if (r) {
           logger.info(`📁 Arquivo diário concluído: ${r.count} trades de ${r.day}`);
-          await notify(`📁 *Arquivo diário ${r.day}*\n${r.count} trades · P&L €${r.pnl.toFixed(2)} · WR ${r.winRate}%`).catch(() => {});
+          await notify(tg.dailySummary(r)).catch(() => {});
         }
       } catch (err) {
         logger.error(`Arquivo diário falhou: ${err.message}`);

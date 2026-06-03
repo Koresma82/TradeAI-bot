@@ -50,6 +50,29 @@ const tg = {
 
   alert: (msg) => `⚠️ *ALERTA TradeAI*\n${msg}`,
   error: (msg) => `🔴 *ERRO TradeAI*\n\`${msg}\``,
+
+  // Resumo diário detalhado por origem (enviado à meia-noite com o arquivo)
+  dailySummary: (r) => {
+    const linhas = Object.entries(r.porOrigem || {})
+      .sort((a, b) => b[1].pnl - a[1].pnl) // melhor P&L primeiro
+      .map(([origem, s]) => {
+        const wr = s.n ? Math.round(s.wins / s.n * 100) : 0;
+        const icon = origem === "AI Brain" ? "🤖"
+                   : origem === "Day Trading" ? "⚡"
+                   : origem === "Manual" ? "✋" : "🎯";
+        return `${icon} *${origem}*: ${s.n} trades · WR ${wr}% · ${s.pnl >= 0 ? "+" : ""}€${s.pnl.toFixed(2)}`;
+      })
+      .join("\n");
+
+    const wrTotal = r.count ? Math.round((r.wins || 0) / r.count * 100) : 0;
+    return (
+      `🗓 *Resumo do dia — ${r.day}*\n\n` +
+      `Total: ${r.count} trades · WR ${wrTotal}%\n` +
+      `P&L do dia: *${r.pnl >= 0 ? "+" : ""}€${r.pnl.toFixed(2)}*\n` +
+      (linhas ? `\n*Por origem:*\n${linhas}` : "") +
+      `\n\n_Arquivado. Vê o histórico completo na app._`
+    );
+  },
 };
 
 module.exports = { initTelegram, notify, tg };

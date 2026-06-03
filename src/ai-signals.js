@@ -80,12 +80,15 @@ async function refresh() {
 
     if (!lines) return signals;
 
+    const ids = prices.ASSETS.filter(a => TRADEABLE.has(a.id) && all[a.id]?.price).map(a => a.id);
     const result = await callGroq([
-      { role: "system", content: "Trader profissional. Respondes SO com JSON puro valido, sem markdown." },
+      { role: "system", content: "És um trader profissional. Respondes SÓ com JSON puro válido, sem markdown, sem texto antes ou depois." },
       { role: "user", content:
-`Sinal por ativo (tendencia+momento): ${lines}
-JSON: {"signals":[{"id":"btc","sinal":"COMPRAR|VENDER|AGUARDAR","confianca":78,"razao":"frase curta pt"}]}` },
-    ]);
+`Analisa CADA UM destes ${ids.length} ativos (tendência+momento) e dá um sinal para TODOS, sem exceção: ${lines}
+
+Responde com um objeto JSON com a chave "signals", uma lista com EXATAMENTE ${ids.length} entradas, uma por ativo desta lista: ${ids.join(", ")}.
+Formato de cada entrada: {"id":"<id>","sinal":"COMPRAR|VENDER|AGUARDAR","confianca":<0-100>,"razao":"<frase curta em pt>"}` },
+    ], { max_tokens: 1500 });
 
     const map = {};
     (result.signals || []).forEach(s => {
@@ -111,5 +114,13 @@ JSON: {"signals":[{"id":"btc","sinal":"COMPRAR|VENDER|AGUARDAR","confianca":78,"
 function getSignals()        { return signals; }
 function getSignal(assetId)  { return signals[assetId] || null; }
 function getRefreshMinutes() { return refreshMin; }
+// Saúde do Groq: se rate-limited, devolve até quando; senão ok
+function getGroqHealth() {
+  const now = Date.now();
+  if (now < rateLimitedUntil) {
+    return { ok: false, rateLimited: true, untilMs: rateLimitedUntil };
+  }
+  return { ok: true, rateLimited: false, untilMs: 0 };
+}
 
-module.exports = { refresh, getSignals, getSignal, setRefreshMinutes, getRefreshMinutes };
+module.exports = { refresh, getSignals, getSignal, setRefreshMinutes, getRefreshMinutes, getGroqHealth };

@@ -9,6 +9,7 @@ const prices  = require("./prices");
 const stats   = require("./stats");
 const aiSignals = require("./ai-signals");
 const dayTrading = require("./day-trading");
+const broker  = require("./broker");
 const { notify, tg } = require("./telegram");
 
 const uid = () => require("crypto").randomUUID();
@@ -108,6 +109,16 @@ async function checkSLTP(currentPrices) {
 
     const pnl = (closePrice - pos.entryPrice) * pos.units;
     const icon = pnl >= 0 ? "✅" : "🛑";
+
+    // ── Executar a venda real na Alpaca se em modo live ──
+    if (broker.isLive()) {
+      const exec = await broker.sell({ assetId: pos.assetId, units: pos.units, price: closePrice });
+      if (!exec.ok) {
+        logger.warn(`Venda ${pos.assetSym} falhou: ${exec.reason} — tenta no próximo tick`);
+        continue; // não fecha localmente se a corretora recusou
+      }
+    }
+
     logger.info(`${icon} ${reason} ${pos.assetSym} | P&L ${sign(pnl)}${eur(pnl)}`);
 
     const closedTrade = {
@@ -183,23 +194,33 @@ async function executeBuy(strategy, assetId, price) {
   const units = +(amount / price).toFixed(7);
   const sl    = +(price * (1 - strategy.sl  / 100)).toFixed(4);
   const tp    = +(price * (1 + strategy.tp  / 100)).toFixed(4);
-  const posId = `sim_${Date.now()}_${assetId}`;
+  const posId = `${broker.isLive() ? "live" : "sim"}_${Date.now()}_${assetId}`;
+
+  // ── Executar a ordem (real na Alpaca se MODE=paper/real; senão simulada) ──
+  const exec = await broker.buy({ assetId, amount, price, sl, tp });
+  if (!exec.ok) {
+    logger.warn(`Compra ${assetId} não executada: ${exec.reason}`);
+    return;
+  }
+  const fillPrice = exec.fillPrice || price;
+  const realUnits = +(amount / fillPrice).toFixed(7);
 
   const position = {
     id:          posId,
     assetId,
     assetName:   assetId,
     assetSym:    assetId.toUpperCase(),
-    entryPrice:  price,
-    units,
+    entryPrice:  fillPrice,
+    units:       realUnits,
     amount,
-    peak:        price,
+    peak:        fillPrice,
     sl, tp,
     strategy:    strategy.nome,
     stratId:     strategy.id,
     openedAt:    new Date().toLocaleTimeString("pt-PT"),
     status:      "ABERTA",
-    mode:        "sim",
+    mode:        broker.isLive() ? "live" : "sim",
+    brokerOrderId: exec.brokerOrderId || null,
   };
 
   openPositions[posId] = position;
@@ -209,9 +230,9 @@ async function executeBuy(strategy, assetId, price) {
   // Guarda no Firestore — a app React vê em tempo real
   await fb.saveTrade("server", position);
   await fb.saveBalance("server", simBalance);
-  await notify(tg.tradeOpen(position, "demo"));
+  await notify(tg.tradeOpen(position, broker.getMode()));
 
-  logger.info(`BUY SIM ${assetId} | €${amount} | @$${price} | SL $${sl} | TP $${tp}`);
+  logger.info(`BUY ${broker.getMode().toUpperCase()} ${assetId} | €${amount} | @$${fillPrice} | SL $${sl} | TP $${tp}`);
 }
 
 // ── Hooks usados pelo módulo de day trading ──────────────────────────────────
@@ -415,11 +436,20 @@ async function tick() {
     };
     const featuresJson = JSON.stringify(features);
     if (featuresJson !== lastFeaturesJson || now - lastHeartbeatAt >= HEARTBEAT_MS) {
+      // Estado de saúde das APIs (para o health check na app)
+      const ph = prices.getSourceHealth();
+      const gh = aiSignals.getGroqHealth();
+      const apiHealth = {
+        groq:      { ok: gh.ok, rateLimited: gh.rateLimited, untilMs: gh.untilMs },
+        stooq:     { ok: ph.stooq.ok,     lastOk: ph.stooq.lastOk,     err: ph.stooq.lastErr },
+        coingecko: { ok: ph.coingecko.ok, lastOk: ph.coingecko.lastOk, err: ph.coingecko.lastErr },
+      };
       await fb.saveSetting("server", "botStatus", {
         alive:    true,
-        mode:     "sim",
+        mode:     broker.getMode(),
         lastSeen: now,
         features,
+        apiHealth,
       });
       lastHeartbeatAt  = now;
       lastFeaturesJson = featuresJson;
@@ -435,10 +465,34 @@ async function tick() {
 async function init() {
   logger.info("═══════════════════════════════════");
   logger.info("  TradeAI Sim Engine 24/7");
+  logger.info(`  Modo: ${broker.getMode().toUpperCase()}`);
   logger.info(`  Capital: €${simCapital}`);
   logger.info("═══════════════════════════════════");
 
   stats.setBalance(simBalance);
+
+  // ── Verificar a corretora (em modo paper/real) ──
+  try {
+    await broker.verifyConnection();
+    if (broker.isReal()) {
+      logger.warn("💵💵💵 ATENÇÃO: MODO REAL ATIVO — as ordens usam DINHEIRO REAL 💵💵💵");
+      await notify("💵 *TradeAI em MODO REAL* — ordens com dinheiro real ativas.").catch(() => {});
+    }
+    // Em live, o saldo de referência vem da conta real
+    const realBal = await broker.getBalance();
+    if (realBal != null && realBal > 0) {
+      simBalance = +realBal.toFixed(2);
+      simCapital = simBalance;
+      stats.setBalance(simBalance);
+      logger.info(`Saldo da corretora: €${simBalance}`);
+    }
+  } catch (e) {
+    logger.error(`Corretora indisponível: ${e.message}`);
+    if (broker.isLive()) {
+      // Em modo live, não arranca às cegas sem corretora
+      throw new Error(`Não foi possível ligar à corretora em modo ${broker.getMode()}: ${e.message}`);
+    }
+  }
 
   // Carregar saldo guardado
   const savedBal = await fb.getBalance("server");

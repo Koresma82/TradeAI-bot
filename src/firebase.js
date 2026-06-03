@@ -169,11 +169,10 @@ async function archiveClosedTrades(dateStr) {
     return d.toISOString().split("T")[0];
   })();
 
-  // Ler trades fechados (status != ABERTA) — só modo sim
+  // Ler trades fechados (status != ABERTA) — qualquer modo (sim/paper/live)
   const snap = await userCol("trades").where("status", "!=", "ABERTA").get();
   const fechadas = snap.docs
-    .map(d => ({ _ref: d.ref, id: d.id, ...d.data() }))
-    .filter(t => t.mode === "sim");
+    .map(d => ({ _ref: d.ref, id: d.id, ...d.data() }));
 
   if (!fechadas.length) {
     logger.info(`Arquivo ${day}: nenhum trade fechado para arquivar`);
@@ -185,6 +184,21 @@ async function archiveClosedTrades(dateStr) {
   const wins    = limpos.filter(t => (t.pnl || 0) > 0).length;
   const winRate = limpos.length ? +(wins / limpos.length * 100).toFixed(1) : 0;
 
+  // Breakdown por origem (AI Brain, estratégias, day trading, manual)
+  const origemDe = (t) =>
+      t.stratId === "ai-brain"   ? "AI Brain"
+    : t.stratId === "daytrading" ? "Day Trading"
+    : t.stratId === "manual"     ? "Manual"
+    :                              "Estratégias";
+  const porOrigem = {};
+  limpos.forEach(t => {
+    const o = origemDe(t);
+    if (!porOrigem[o]) porOrigem[o] = { n: 0, wins: 0, pnl: 0 };
+    porOrigem[o].n++;
+    if ((t.pnl || 0) > 0) porOrigem[o].wins++;
+    porOrigem[o].pnl = +(porOrigem[o].pnl + (t.pnl || 0)).toFixed(2);
+  });
+
   // 1. Gravar o documento de arquivo do dia
   await userCol("archives").doc(day).set({
     day,
@@ -193,6 +207,7 @@ async function archiveClosedTrades(dateStr) {
     pnl,
     winRate,
     wins,
+    porOrigem,
     archivedAt: admin.firestore.FieldValue.serverTimestamp(),
   });
 
@@ -205,7 +220,7 @@ async function archiveClosedTrades(dateStr) {
   }
 
   logger.info(`📁 Arquivo ${day}: ${limpos.length} trades movidos · P&L ${pnl >= 0 ? "+" : "−"}€${Math.abs(pnl)} · WR ${winRate}%`);
-  return { day, count: limpos.length, pnl, winRate };
+  return { day, count: limpos.length, pnl, winRate, wins, porOrigem };
 }
 
 module.exports = {

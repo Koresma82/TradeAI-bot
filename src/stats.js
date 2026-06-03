@@ -87,10 +87,10 @@ class StatsEngine {
   }
 
   // ── Relatório diário (chamado pelo cron) ─────────────────────────────────────
-  async dailyReport() {
+  async dailyReport(sendNotification = true) {
     const m = this.getMetrics();
     await saveStats(m);
-    await notify(tg.dailyReport(m));
+    if (sendNotification) await notify(tg.dailyReport(m));
     logger.info(
       `📊 Stats: ${m.totalTrades} trades | WR ${m.winRate.toFixed(1)}% | ` +
       `P&L €${m.totalPnl.toFixed(2)} | DD ${m.maxDrawdown.toFixed(1)}% | Sharpe ${m.sharpe.toFixed(2)}`
