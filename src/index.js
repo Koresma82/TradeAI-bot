@@ -96,6 +96,21 @@ async function main() {
       logger.info(`♥ Heartbeat | Trades: ${m.totalTrades} | P&L: €${m.totalPnl?.toFixed(2)}`);
     });
 
+    // Arquivo automático à meia-noite — move os trades fechados do dia anterior
+    // para users/{uid}/archives/{dia} e limpa a lista ativa. (fuso de Portugal)
+    cron.schedule("0 0 * * *", async () => {
+      try {
+        const r = await fb.archiveClosedTrades();
+        if (r) {
+          logger.info(`📁 Arquivo diário concluído: ${r.count} trades de ${r.day}`);
+          await notify(`📁 *Arquivo diário ${r.day}*\n${r.count} trades · P&L €${r.pnl.toFixed(2)} · WR ${r.winRate}%`).catch(() => {});
+        }
+      } catch (err) {
+        logger.error(`Arquivo diário falhou: ${err.message}`);
+        await fb.logError("daily-archive", err).catch(() => {});
+      }
+    }, { timezone: "Europe/Lisbon" });
+
     // ── GRACEFUL SHUTDOWN ──────────────────────────────────────────────────
     const shutdown = async (sig) => {
       logger.info(`${sig} — a encerrar…`);

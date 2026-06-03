@@ -147,6 +147,57 @@ async function logError(context, error) {
   } catch (e) { /* silencioso */ }
 }
 
+// ── Arquivar trades fechados do dia ──────────────────────────────────────────
+// Move todos os trades já FECHADOS para users/{uid}/archives/{dia} e remove-os
+// da coleção "trades" ativa. Mantém as posições ABERTAS intactas.
+// Devolve um resumo { dia, count, pnl, winRate } ou null se não houver nada.
+async function archiveClosedTrades(dateStr) {
+  // dia a arquivar: por defeito ontem (corre à meia-noite a fechar o dia anterior)
+  const day = dateStr || (() => {
+    const d = new Date();
+    d.setDate(d.getDate() - 1);
+    return d.toISOString().split("T")[0];
+  })();
+
+  // Ler trades fechados (status != ABERTA) — só modo sim
+  const snap = await userCol("trades").where("status", "!=", "ABERTA").get();
+  const fechadas = snap.docs
+    .map(d => ({ _ref: d.ref, id: d.id, ...d.data() }))
+    .filter(t => t.mode === "sim");
+
+  if (!fechadas.length) {
+    logger.info(`Arquivo ${day}: nenhum trade fechado para arquivar`);
+    return null;
+  }
+
+  const limpos = fechadas.map(({ _ref, ...t }) => t); // sem a referência interna
+  const pnl     = +limpos.reduce((s, t) => s + (t.pnl || 0), 0).toFixed(2);
+  const wins    = limpos.filter(t => (t.pnl || 0) > 0).length;
+  const winRate = limpos.length ? +(wins / limpos.length * 100).toFixed(1) : 0;
+
+  // 1. Gravar o documento de arquivo do dia
+  await userCol("archives").doc(day).set({
+    day,
+    trades:   limpos,
+    count:    limpos.length,
+    pnl,
+    winRate,
+    wins,
+    archivedAt: admin.firestore.FieldValue.serverTimestamp(),
+  });
+
+  // 2. Apagar os trades fechados da coleção ativa (em lotes de 400)
+  const refs = fechadas.map(t => t._ref);
+  for (let i = 0; i < refs.length; i += 400) {
+    const batch = db.batch();
+    refs.slice(i, i + 400).forEach(r => batch.delete(r));
+    await batch.commit();
+  }
+
+  logger.info(`📁 Arquivo ${day}: ${limpos.length} trades movidos · P&L ${pnl >= 0 ? "+" : "−"}€${Math.abs(pnl)} · WR ${winRate}%`);
+  return { day, count: limpos.length, pnl, winRate };
+}
+
 module.exports = {
   initFirebase,
   watchStrategies,
@@ -159,5 +210,6 @@ module.exports = {
   logError,
   getSetting,
   watchSetting,
+  archiveClosedTrades,
   USER_UID,
 };
