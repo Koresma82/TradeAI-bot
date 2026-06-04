@@ -6,6 +6,7 @@
 const logger  = require("./logger");
 const fb      = require("./firebase");
 const prices  = require("./prices");
+const indicators = require("./indicators");
 const stats   = require("./stats");
 const aiSignals = require("./ai-signals");
 const dayTrading = require("./day-trading");
@@ -17,7 +18,8 @@ const uid = () => require("crypto").randomUUID();
 // ── Estado em memória ─────────────────────────────────────────────────────────
 let strategies    = [];
 let openPositions = {};  // { posId: { ...position } }
-let priceHistory  = {};  // { assetId: [{ price, ts }] }
+let priceHistory  = {};  // { assetId: [{ price, ts }] } — intradiário (curto prazo)
+let dailySeries   = {};  // { assetId: [fechos diários] } — para indicadores (RSI/MM)
 let lastBuyTime   = {};  // cooldown por estratégia/ativo
 let tickCount     = 0;
 let totalInvested = 0;
@@ -53,6 +55,24 @@ const TRADEABLE = new Set(["btc","eth","wti","gold","silver","spy","qqq","gld","
 // ── Helpers ───────────────────────────────────────────────────────────────────
 const sign = v => v >= 0 ? "+" : "−";
 const eur  = v => `€${Math.abs(v).toFixed(2)}`;
+
+// Categorias por ativo (para saber se o mercado está aberto)
+const ASSET_CAT = Object.fromEntries(prices.ASSETS.map(a => [a.id, a.cat]));
+
+// Mercado aberto para um ativo?
+//  - Crypto: sempre (24/7)
+//  - Forex:  seg-sex (24h nos dias úteis)
+//  - ETF/Commodity (US): seg-sex, 14:30–21:00 UTC (NYSE/COMEX aprox.)
+function isMarketOpenFor(assetId) {
+  const cat = ASSET_CAT[assetId];
+  if (cat === "Crypto") return true;
+  const now = new Date();
+  const dow = now.getUTCDay();        // 0=dom, 6=sáb
+  if (dow === 0 || dow === 6) return false;
+  if (cat === "Forex") return true;   // dias úteis: forex praticamente 24h
+  const mins = now.getUTCHours() * 60 + now.getUTCMinutes();
+  return mins >= 14 * 60 + 30 && mins <= 21 * 60; // 14:30–21:00 UTC
+}
 
 function recordPrice(assetId, price) {
   if (!priceHistory[assetId]) priceHistory[assetId] = [];
@@ -95,15 +115,23 @@ async function checkSLTP(currentPrices) {
     let closePrice = price;
 
     // ── Saída antecipada se a IA virar para VENDER com confiança ──
+    // Só fecha SE houver lucro (a função é "proteger ganhos", não sair a zero/perda).
     const sg = aiSignals.getSignal(pos.assetId);
-    if (exitOnFlip && sg && sg.sinal === "VENDER" && (sg.confianca || 0) >= flipConf && price > pos.sl) {
+    const emLucro = price > pos.entryPrice;
+    if (exitOnFlip && sg && sg.sinal === "VENDER" && (sg.confianca || 0) >= flipConf && emLucro && price > pos.sl) {
       reason = "AI-EXIT"; closePrice = price;
     }
     else if (price <= pos.sl) {
       reason = (trailingOn && pos.sl > pos.entryPrice) ? "TRAIL" : "SL";
-      closePrice = pos.sl;
+      // Fecha ao preço REAL de mercado, não ao SL teórico. Quando o preço salta
+      // para lá do SL, fechas onde o mercado está — isto reflete o slippage real
+      // e evita que a simulação pareça melhor do que o paper/real será.
+      closePrice = Math.min(price, pos.sl);
     }
-    else if (price >= pos.tp) { reason = "TP"; closePrice = pos.tp; }
+    else if (price >= pos.tp) {
+      reason = "TP";
+      closePrice = Math.max(price, pos.tp); // idem: preço real, não o TP teórico
+    }
 
     if (!reason) continue;
 
@@ -283,6 +311,8 @@ async function runAiBrain(currentPrices) {
   for (const sg of Object.values(sigs)) {
     if (!sg || sg.sinal !== "COMPRAR" || (sg.confianca || 0) < minConf) continue;
     if (!TRADEABLE.has(sg.id)) continue;
+    // Não abrir em mercado fechado (evita flip-flop a preços congelados)
+    if (!isMarketOpenFor(sg.id)) continue;
     const pd = currentPrices[sg.id];
     if (!pd?.price) continue;
 
@@ -323,9 +353,17 @@ async function runAiBrain(currentPrices) {
 // ── Tick principal ────────────────────────────────────────────────────────────
 async function tick() {
   try {
+    tickCount++;
     // 1. Refresh preços
     await prices.refreshAll();
     const currentPrices = prices.getAll();
+
+    // Atualizar histórico diário 1x/dia (a cada ~2880 ticks de 30s) para os indicadores
+    if (tickCount % 2880 === 0) {
+      prices.fetchHistory().then(h => {
+        if (Object.keys(h).length) { dailySeries = h; logger.info("📈 Histórico diário atualizado"); }
+      }).catch(() => {});
+    }
 
     // Atualizar sinais AI (intervalo configurável) e persistir para a app os mostrar
     const sigsBefore = JSON.stringify(aiSignals.getSignals());
@@ -350,18 +388,37 @@ async function tick() {
         for (const assetId of (strategy.ativos || [])) {
           const priceData = currentPrices[assetId];
           if (!priceData?.price) continue;
+          // Não comprar em mercado fechado (preços congelados → sinais falsos)
+          if (!isMarketOpenFor(assetId)) continue;
 
           // Cooldown: não comprar o mesmo ativo/estratégia mais que 1x por 2 min
           const cdKey = `${strategy.id}_${assetId}`;
           const lastBuy = lastBuyTime[cdKey] || 0;
           if (Date.now() - lastBuy < 120000) continue;
 
-          // Verificar sinal: queda do máximo recente
-          const high = getRecentHigh(assetId);
-          if (!high) continue;
-          const dropPct = ((high - priceData.price) / high) * 100;
-          if (dropPct >= strategy.compra) {
-            logger.info(`🎯 Sinal: ${strategy.nome} → ${assetId} (queda ${dropPct.toFixed(2)}% ≥ ${strategy.compra}%)`);
+          // ── Sinal realista: combina histórico diário (RSI + média móvel)
+          //    com a queda intradiária recente. Precisa de ≥2 critérios. ──
+          // Série = histórico diário + o preço de hoje no fim (para refletir o agora)
+          const daily = dailySeries[assetId] || [];
+          const serie = daily.length ? [...daily.slice(-89), priceData.price] : [];
+
+          let sinal;
+          if (serie.length >= 15) {
+            // Temos histórico real → usa indicadores técnicos
+            sinal = indicators.buySignal(serie, {
+              dropTrigger: strategy.compra,           // gatilho de queda da estratégia
+              rsiOversold: strategy.risco === "alto" ? 45 : strategy.risco === "baixo" ? 30 : 38,
+              smaLong:     50,
+            });
+          } else {
+            // Fallback: ainda sem histórico → usa só a queda intradiária (como antes)
+            const high = getRecentHigh(assetId);
+            const dropPct = high ? ((high - priceData.price) / high) * 100 : 0;
+            sinal = { buy: dropPct >= strategy.compra, score: 60, reason: `queda ${dropPct.toFixed(1)}% (sem histórico)` };
+          }
+
+          if (sinal.buy) {
+            logger.info(`🎯 Sinal: ${strategy.nome} → ${assetId} | ${sinal.reason} (força ${sinal.score})`);
             const before = Object.keys(openPositions).length;
             await executeBuy(strategy, assetId, priceData.price);
             if (Object.keys(openPositions).length > before) lastBuyTime[cdKey] = Date.now();
@@ -379,7 +436,6 @@ async function tick() {
     }).catch(err => logger.warn(`DayTrading run: ${err.message}`));
 
     // 3b. Log de diagnóstico (a cada 10 ticks) — mostra estado dos sinais
-    tickCount++;
     if (tickCount % 10 === 0 && strategies.length > 0) {
       const diags = [];
       for (const strategy of strategies) {
@@ -579,6 +635,15 @@ async function init() {
   // Primeiro fetch de preços
   await prices.refreshAll();
   logger.info("Preços inicializados ✓");
+
+  // Carregar histórico diário para os indicadores (RSI, médias móveis)
+  try {
+    dailySeries = await prices.fetchHistory();
+    const n = Object.keys(dailySeries).length;
+    logger.info(`📈 Histórico carregado para ${n} ativos (indicadores prontos)`);
+  } catch (e) {
+    logger.warn(`Histórico indisponível: ${e.message} — indicadores acumulam ao vivo`);
+  }
 
   // Loop principal
   const TICK_MS = parseInt(process.env.SIM_TICK_MS || "30000"); // 30s por defeito

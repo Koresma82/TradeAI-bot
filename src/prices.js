@@ -159,4 +159,43 @@ async function refreshAll() {
 function getPrice(assetId) { return priceCache[assetId]?.price || BASE_PRICES[assetId] || null; }
 function getAll()          { return { ...priceCache }; }
 
-module.exports = { refreshAll, getPrice, getAll, getSourceHealth, ASSETS, BASE_PRICES };
+// ── Histórico diário (para indicadores: RSI, médias móveis) ──────────────────
+// Busca ~3 meses de fechos diários. Stooq (ações/ETF/commodity/forex) e
+// CoinGecko (crypto). Devolve { assetId: [preços, mais antigo→recente] }.
+async function fetchHistory() {
+  const hist = {};
+
+  // Stooq: endpoint de histórico diário por símbolo
+  const stooqAssets = ASSETS.filter(a => a.stooq);
+  for (const a of stooqAssets) {
+    try {
+      const url = `https://stooq.com/q/d/l/?s=${a.stooq}&i=d`;
+      const r = await fetchWithRetry(url, { headers: { "User-Agent": "Mozilla/5.0" } }, { tries: 2, timeoutMs: 10000 });
+      if (!r.ok) continue;
+      const csv = (await r.text()).trim().split("\n");
+      // cabeçalho: Date,Open,High,Low,Close,Volume
+      const closes = csv.slice(1)
+        .map(l => parseFloat(l.split(",")[4]))
+        .filter(v => !isNaN(v));
+      if (closes.length) hist[a.id] = closes.slice(-90); // últimos ~90 dias
+    } catch (e) { /* ignora; indicadores nascem quando houver dados */ }
+  }
+
+  // CoinGecko: market_chart com 90 dias
+  const cgAssets = ASSETS.filter(a => a.cg);
+  for (const a of cgAssets) {
+    try {
+      const url = `https://api.coingecko.com/api/v3/coins/${a.cg}/market_chart?vs_currency=usd&days=90&interval=daily`;
+      const r = await fetchWithRetry(url, { headers: { "Accept": "application/json" } }, { tries: 2, timeoutMs: 10000 });
+      if (!r.ok) continue;
+      const data = await r.json();
+      const closes = (data.prices || []).map(p => p[1]).filter(v => !isNaN(v));
+      if (closes.length) hist[a.id] = closes.slice(-90);
+      await new Promise(res => setTimeout(res, 1500)); // respeitar rate limit do CG
+    } catch (e) { /* ignora */ }
+  }
+
+  return hist;
+}
+
+module.exports = { refreshAll, getPrice, getAll, getSourceHealth, fetchHistory, ASSETS, BASE_PRICES };
