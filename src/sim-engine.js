@@ -588,6 +588,26 @@ async function init() {
     logger.error(`Falha a recuperar posições abertas: ${e.message}`);
   }
 
+  // Vigiar trades abertos em tempo real — apanha compras MANUAIS feitas na app
+  // (sem isto, o bot só as geria após um restart). Funde sem duplicar nem
+  // sobrescrever as posições que o próprio bot já tem em memória.
+  fb.watchOpenTrades(abertas => {
+    const idsFirestore = new Set(abertas.map(p => p.id));
+    abertas.forEach(p => {
+      if (!openPositions[p.id]) {
+        openPositions[p.id] = p; // nova posição (ex.: compra manual da app)
+        logger.info(`➕ Posição externa detetada: ${p.assetSym || p.assetId} (${p.stratId || "?"})`);
+      }
+    });
+    // Remover do estado as posições que já não estão abertas no Firestore
+    // (ex.: fechadas manualmente na app), exceto as que o bot está a fechar agora.
+    Object.keys(openPositions).forEach(id => {
+      if (!idsFirestore.has(id) && openPositions[id]?.status === "ABERTA") {
+        delete openPositions[id];
+      }
+    });
+  });
+
   // Subscrever estratégias em tempo real
   fb.watchStrategies(newStrats => {
     strategies = newStrats;

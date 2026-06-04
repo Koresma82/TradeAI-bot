@@ -84,10 +84,12 @@ async function saveTrade(uid, trade) {
 // Sem isto, um restart do bot esquece as posições abertas e deixa-as órfãs
 // (sem stop-loss / take-profit a serem aplicados).
 async function loadOpenPositions(uid) {
+  const mode = (process.env.MODE || "sim").toLowerCase();
+  const wantMode = (mode === "paper" || mode === "real") ? "live" : "sim";
   const snap = await userCol("trades").where("status", "==", "ABERTA").get();
   return snap.docs
     .map(d => ({ id: d.id, ...d.data() }))
-    .filter(t => t.mode === "sim");
+    .filter(t => t.mode === wantMode);
 }
 
 // ── Actualizar trade (fechar posição) ────────────────────────────────────────
@@ -118,13 +120,19 @@ async function saveStats(uid, stats) {
 
 // ── Ler saldo actual guardado ─────────────────────────────────────────────────
 async function getBalance(uid) {
-  const snap = await userDoc("settings", "simBalance").get();
+  const mode = (process.env.MODE || "sim").toLowerCase();
+  const key  = (mode === "paper" || mode === "real") ? "liveBalance" : "simBalance";
+  const snap = await userDoc("settings", key).get();
   return snap.exists ? snap.data().value : null;
 }
 
 // ── Actualizar saldo ──────────────────────────────────────────────────────────
 async function saveBalance(uid, value) {
-  await userDoc("settings", "simBalance").set({
+  // Escreve na chave conforme o modo: simBalance (sim) ou liveBalance (paper/real).
+  // Assim a app mostra o saldo certo em cada vista sem os misturar.
+  const mode = (process.env.MODE || "sim").toLowerCase();
+  const key  = (mode === "paper" || mode === "real") ? "liveBalance" : "simBalance";
+  await userDoc("settings", key).set({
     value,
     updatedAt: admin.firestore.FieldValue.serverTimestamp(),
   });
@@ -143,6 +151,22 @@ function watchSetting(key, callback) {
   return userDoc("settings", key).onSnapshot(snap => {
     if (snap.exists) callback(snap.data().value);
   }, () => {});
+}
+
+// ── Vigiar trades abertos (apanha compras MANUAIS feitas na app em tempo real) ──
+// O bot só carregava posições no arranque; sem isto, uma compra manual na app
+// só seria gerida (SL/TP) após um restart. Agora o bot apanha-as logo.
+function watchOpenTrades(callback) {
+  const mode = (process.env.MODE || "sim").toLowerCase();
+  const wantMode = (mode === "paper" || mode === "real") ? "live" : "sim";
+  return userCol("trades")
+    .where("status", "==", "ABERTA")
+    .onSnapshot(snap => {
+      const abertas = snap.docs
+        .map(d => ({ id: d.id, ...d.data() }))
+        .filter(t => t.mode === wantMode);
+      callback(abertas);
+    }, err => logger.error(`watchOpenTrades erro: ${err.message}`));
 }
 
 // ── Guardar log de erro ───────────────────────────────────────────────────────
@@ -228,6 +252,7 @@ module.exports = {
   watchStrategies,
   saveTrade,
   loadOpenPositions,
+  watchOpenTrades,
   updateTrade,
   saveSetting,
   saveStats,
