@@ -316,6 +316,20 @@ async function runAiBrain(currentPrices) {
     const pd = currentPrices[sg.id];
     if (!pd?.price) continue;
 
+    // ── Travão de sanidade: o Groq pode inflacionar confiança (diz 100% em
+    //    ativos parados). Só entra se os INDICADORES TÉCNICOS também concordarem.
+    //    Assim o AI Brain combina o "raciocínio" do LLM com dados objetivos. ──
+    const daily = dailySeries[sg.id] || [];
+    if (daily.length >= 15) {
+      const serie = [...daily.slice(-89), pd.price];
+      const tech = indicators.buySignal(serie, { dropTrigger: 1.0, rsiOversold: 45, smaLong: 50 });
+      if (!tech.buy) {
+        // Groq diz comprar mas os indicadores não confirmam → ignora (evita falsos sinais)
+        continue;
+      }
+    }
+    // (se não há histórico suficiente, confia só no Groq — fallback)
+
     // cooldown 5 min por ativo
     if (Date.now() - (aiBrainCooldown[sg.id] || 0) < 5 * 60 * 1000) continue;
     // não duplicar posição AI no mesmo ativo
