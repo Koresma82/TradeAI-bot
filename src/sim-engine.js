@@ -114,11 +114,16 @@ async function checkSLTP(currentPrices) {
     let reason = null;
     let closePrice = price;
 
+    // ── Hold manual: se o utilizador ligou "Hold" nesta posição, o bot NÃO
+    //    fecha por AI-EXIT nem por TP — deixa o lucro correr. Mas o SL mantém-se
+    //    sempre (proteção contra perdas). ──
+    const onHold = pos.hold === true;
+
     // ── Saída antecipada se a IA virar para VENDER com confiança ──
     // Só fecha SE houver lucro (a função é "proteger ganhos", não sair a zero/perda).
     const sg = aiSignals.getSignal(pos.assetId);
     const emLucro = price > pos.entryPrice;
-    if (exitOnFlip && sg && sg.sinal === "VENDER" && (sg.confianca || 0) >= flipConf && emLucro && price > pos.sl) {
+    if (!onHold && exitOnFlip && sg && sg.sinal === "VENDER" && (sg.confianca || 0) >= flipConf && emLucro && price > pos.sl) {
       reason = "AI-EXIT"; closePrice = price;
     }
     else if (price <= pos.sl) {
@@ -128,7 +133,7 @@ async function checkSLTP(currentPrices) {
       // e evita que a simulação pareça melhor do que o paper/real será.
       closePrice = Math.min(price, pos.sl);
     }
-    else if (price >= pos.tp) {
+    else if (!onHold && price >= pos.tp) {
       reason = "TP";
       closePrice = Math.max(price, pos.tp); // idem: preço real, não o TP teórico
     }
@@ -597,6 +602,10 @@ async function init() {
       if (!openPositions[p.id]) {
         openPositions[p.id] = p; // nova posição (ex.: compra manual da app)
         logger.info(`➕ Posição externa detetada: ${p.assetSym || p.assetId} (${p.stratId || "?"})`);
+      } else if (openPositions[p.id].hold !== p.hold) {
+        // Sincronizar o flag 'hold' quando o utilizador o liga/desliga na app
+        openPositions[p.id].hold = p.hold;
+        logger.info(`${p.hold ? "🔒 HOLD ligado" : "🔓 HOLD desligado"}: ${p.assetSym || p.assetId}`);
       }
     });
     // Remover do estado as posições que já não estão abertas no Firestore
