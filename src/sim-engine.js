@@ -147,18 +147,11 @@ async function checkSLTP(currentPrices) {
       reason = "AI-EXIT"; closePrice = price;
     }
     else if (price <= pos.sl) {
-      // ── Carência de SL para posições MANUAIS: nos primeiros 60s após a compra
-      //    manual, o bot não fecha por SL. Evita o fecho-relâmpago logo a seguir
-      //    à entrada (cripto volátil em que o preço já estava perto do SL). As
-      //    posições automáticas continuam protegidas de imediato. ──
-      const manualGrace = pos.stratId === "manual" && idadeMs < 60000;
-      if (!manualGrace) {
-        reason = (trailingOn && pos.sl > pos.entryPrice) ? "TRAIL" : "SL";
-        // Fecha ao preço REAL de mercado, não ao SL teórico. Quando o preço salta
-        // para lá do SL, fechas onde o mercado está — isto reflete o slippage real
-        // e evita que a simulação pareça melhor do que o paper/real será.
-        closePrice = Math.min(price, pos.sl);
-      }
+      reason = (trailingOn && pos.sl > pos.entryPrice) ? "TRAIL" : "SL";
+      // Fecha ao preço REAL de mercado, não ao SL teórico. Quando o preço salta
+      // para lá do SL, fechas onde o mercado está — isto reflete o slippage real
+      // e evita que a simulação pareça melhor do que o paper/real será.
+      closePrice = Math.min(price, pos.sl);
     }
     else if (!onHold && price >= pos.tp) {
       reason = "TP";
@@ -172,7 +165,7 @@ async function checkSLTP(currentPrices) {
 
     // ── Executar a venda real na Alpaca se em modo live ──
     if (broker.isLive()) {
-      const exec = await broker.sell({ assetId: pos.assetId, units: pos.units, price: closePrice });
+      const exec = await broker.sell({ assetId: pos.assetId, units: pos.units, price: closePrice, broker: pos.broker });
       if (!exec.ok) {
         logger.warn(`Venda ${pos.assetSym} falhou: ${exec.reason} — tenta no próximo tick`);
         continue; // não fecha localmente se a corretora recusou
@@ -281,6 +274,7 @@ async function executeBuy(strategy, assetId, price) {
     status:      "ABERTA",
     mode:        broker.isLive() ? "live" : "sim",
     brokerOrderId: exec.brokerOrderId || null,
+    broker:      exec.broker || null,
   };
 
   openPositions[posId] = position;
@@ -555,6 +549,20 @@ async function tick() {
       });
       lastHeartbeatAt  = now;
       lastFeaturesJson = featuresJson;
+
+      // ── Saldos por broker (só em paper/real) → a app mostra-os no Portfólio ──
+      if (broker.isLive() && broker.registry) {
+        try {
+          const balances = {};
+          for (const a of broker.registry.available()) {
+            try { const b = await a.getBalance(); if (b != null) balances[a.id] = +(+b).toFixed(2); }
+            catch (e) { logger.warn(`Saldo ${a.id} falhou: ${e.message}`); }
+          }
+          if (Object.keys(balances).length) {
+            await fb.saveSetting("server", "brokerBalances", balances);
+          }
+        } catch (e) { logger.warn(`brokerBalances não publicado: ${e.message}`); }
+      }
     }
 
   } catch (err) {

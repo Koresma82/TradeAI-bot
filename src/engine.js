@@ -133,11 +133,7 @@ async function checkPositions(prices) {
     let shouldClose = false;
     let reason      = "";
 
-    // Carência de SL para posições manuais nos primeiros 60s (ver sim-engine).
-    const idadeMs = pos.openedTs ? (Date.now() - pos.openedTs) : Infinity;
-    const manualGrace = pos.stratId === "manual" && idadeMs < 60000;
-
-    if (price <= pos.sl && !manualGrace) { shouldClose = true; reason = "SL"; }
+    if (price <= pos.sl) { shouldClose = true; reason = "SL"; }
     if (price >= pos.tp) { shouldClose = true; reason = "TP"; }
 
     if (!shouldClose) continue;
