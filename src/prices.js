@@ -1,45 +1,52 @@
 // src/prices.js
-// Preços reais — CoinGecko (crypto) + Stooq (commodities/ETFs/forex)
-// Stooq funciona bem em datacenters (Yahoo bloqueia frequentemente)
+// Preços reais com FALLBACK EM CASCATA por classe de ativo:
+//   Crypto       : Binance → CoinGecko → cache
+//   Forex        : TwelveData → Stooq → cache
+//   ETF/Commodity: TwelveData → Stooq → Yahoo → cache
+// Não fazemos média de fontes (criaria um preço inexistente e estragaria TP/SL);
+// usamos prioridade + deteção de outliers. TwelveData precisa de TWELVEDATA_KEY.
 
 const logger = require("./logger");
 
+const TWELVE_KEY = process.env.TWELVEDATA_KEY || "";
+
 const ASSETS = [
   // ── Crypto (CoinGecko, 24/7) ──
-  { id:"btc",    sym:"BTC",     name:"Bitcoin",       icon:"₿",  cat:"Crypto",    cg:"bitcoin",      stooq:null     },
-  { id:"eth",    sym:"ETH",     name:"Ethereum",      icon:"Ξ",  cat:"Crypto",    cg:"ethereum",     stooq:null     },
-  { id:"bnb",    sym:"BNB",     name:"BNB",           icon:"🔶", cat:"Crypto",    cg:"binancecoin",  stooq:null     },
-  { id:"sol",    sym:"SOL",     name:"Solana",        icon:"◎",  cat:"Crypto",    cg:"solana",       stooq:null     },
-  { id:"xrp",    sym:"XRP",     name:"XRP",           icon:"✕",  cat:"Crypto",    cg:"ripple",       stooq:null     },
-  { id:"ada",    sym:"ADA",     name:"Cardano",       icon:"₳",  cat:"Crypto",    cg:"cardano",      stooq:null     },
-  { id:"doge",   sym:"DOGE",    name:"Dogecoin",      icon:"🐕", cat:"Crypto",    cg:"dogecoin",     stooq:null     },
-  { id:"avax",   sym:"AVAX",    name:"Avalanche",     icon:"🔺", cat:"Crypto",    cg:"avalanche-2",  stooq:null     },
-  { id:"dot",    sym:"DOT",     name:"Polkadot",      icon:"⬤",  cat:"Crypto",    cg:"polkadot",     stooq:null     },
-  { id:"link",   sym:"LINK",    name:"Chainlink",     icon:"⬡",  cat:"Crypto",    cg:"chainlink",    stooq:null     },
+  { id:"btc",    sym:"BTC",     name:"Bitcoin",       icon:"₿",  cat:"Crypto",    cg:"bitcoin",      stooq:null, binance:"BTCUSDT", td:null, yahoo:null },
+  { id:"eth",    sym:"ETH",     name:"Ethereum",      icon:"Ξ",  cat:"Crypto",    cg:"ethereum",     stooq:null, binance:"ETHUSDT", td:null, yahoo:null },
+  { id:"bnb",    sym:"BNB",     name:"BNB",           icon:"🔶", cat:"Crypto",    cg:"binancecoin",  stooq:null, binance:"BNBUSDT", td:null, yahoo:null },
+  { id:"sol",    sym:"SOL",     name:"Solana",        icon:"◎",  cat:"Crypto",    cg:"solana",       stooq:null, binance:"SOLUSDT", td:null, yahoo:null },
+  { id:"xrp",    sym:"XRP",     name:"XRP",           icon:"✕",  cat:"Crypto",    cg:"ripple",       stooq:null, binance:"XRPUSDT", td:null, yahoo:null },
+  { id:"ada",    sym:"ADA",     name:"Cardano",       icon:"₳",  cat:"Crypto",    cg:"cardano",      stooq:null, binance:"ADAUSDT", td:null, yahoo:null },
+  { id:"doge",   sym:"DOGE",    name:"Dogecoin",      icon:"🐕", cat:"Crypto",    cg:"dogecoin",     stooq:null, binance:"DOGEUSDT", td:null, yahoo:null },
+  { id:"avax",   sym:"AVAX",    name:"Avalanche",     icon:"🔺", cat:"Crypto",    cg:"avalanche-2",  stooq:null, binance:"AVAXUSDT", td:null, yahoo:null },
+  { id:"dot",    sym:"DOT",     name:"Polkadot",      icon:"⬤",  cat:"Crypto",    cg:"polkadot",     stooq:null, binance:"DOTUSDT", td:null, yahoo:null },
+  { id:"link",   sym:"LINK",    name:"Chainlink",     icon:"⬡",  cat:"Crypto",    cg:"chainlink",    stooq:null, binance:"LINKUSDT", td:null, yahoo:null },
   // ── Commodities (Stooq, horário de mercado) ──
-  { id:"wti",    sym:"WTI",     name:"Petróleo WTI",  icon:"🛢", cat:"Commodity", cg:null,           stooq:"cl.f"   },
-  { id:"gold",   sym:"XAU",     name:"Ouro",          icon:"🥇", cat:"Commodity", cg:null,           stooq:"gc.f"   },
-  { id:"silver", sym:"XAG",     name:"Prata",         icon:"🥈", cat:"Commodity", cg:null,           stooq:"si.f"   },
+  { id:"wti",    sym:"WTI",     name:"Petróleo WTI",  icon:"🛢", cat:"Commodity", cg:null,           stooq:"cl.f", binance:null, td:"WTI/USD", yahoo:"CL=F" },
+  { id:"gold",   sym:"XAU",     name:"Ouro",          icon:"🥇", cat:"Commodity", cg:null,           stooq:"gc.f", binance:null, td:"XAU/USD", yahoo:"GC=F" },
+  { id:"silver", sym:"XAG",     name:"Prata",         icon:"🥈", cat:"Commodity", cg:null,           stooq:"si.f", binance:null, td:"XAG/USD", yahoo:"SI=F" },
   // ── ETFs (Stooq, horário de mercado) ──
-  { id:"spy",    sym:"SPY",     name:"S&P 500 ETF",   icon:"📈", cat:"ETF",       cg:null,           stooq:"spy.us" },
-  { id:"qqq",    sym:"QQQ",     name:"Nasdaq ETF",    icon:"💻", cat:"ETF",       cg:null,           stooq:"qqq.us" },
-  { id:"gld",    sym:"GLD",     name:"Gold ETF",      icon:"🏅", cat:"ETF",       cg:null,           stooq:"gld.us" },
-  { id:"iwm",    sym:"IWM",     name:"Russell 2000",  icon:"📊", cat:"ETF",       cg:null,           stooq:"iwm.us" },
-  { id:"tlt",    sym:"TLT",     name:"US Bonds ETF",  icon:"📋", cat:"ETF",       cg:null,           stooq:"tlt.us" },
-  { id:"xle",    sym:"XLE",     name:"Energy ETF",    icon:"⚡", cat:"ETF",       cg:null,           stooq:"xle.us" },
+  { id:"spy",    sym:"SPY",     name:"S&P 500 ETF",   icon:"📈", cat:"ETF",       cg:null,           stooq:"spy.us", binance:null, td:"SPY", yahoo:"SPY" },
+  { id:"qqq",    sym:"QQQ",     name:"Nasdaq ETF",    icon:"💻", cat:"ETF",       cg:null,           stooq:"qqq.us", binance:null, td:"QQQ", yahoo:"QQQ" },
+  { id:"gld",    sym:"GLD",     name:"Gold ETF",      icon:"🏅", cat:"ETF",       cg:null,           stooq:"gld.us", binance:null, td:"GLD", yahoo:"GLD" },
+  { id:"iwm",    sym:"IWM",     name:"Russell 2000",  icon:"📊", cat:"ETF",       cg:null,           stooq:"iwm.us", binance:null, td:"IWM", yahoo:"IWM" },
+  { id:"tlt",    sym:"TLT",     name:"US Bonds ETF",  icon:"📋", cat:"ETF",       cg:null,           stooq:"tlt.us", binance:null, td:"TLT", yahoo:"TLT" },
+  { id:"xle",    sym:"XLE",     name:"Energy ETF",    icon:"⚡", cat:"ETF",       cg:null,           stooq:"xle.us", binance:null, td:"XLE", yahoo:"XLE" },
   // ── Forex (Stooq, dias úteis) ──
-  { id:"eurusd", sym:"EUR/USD", name:"EUR/USD",       icon:"💶", cat:"Forex",     cg:null,           stooq:"eurusd" },
-  { id:"gbpusd", sym:"GBP/USD", name:"GBP/USD",       icon:"💷", cat:"Forex",     cg:null,           stooq:"gbpusd" },
-  { id:"usdjpy", sym:"USD/JPY", name:"USD/JPY",       icon:"¥",  cat:"Forex",     cg:null,           stooq:"usdjpy" },
-  { id:"usdchf", sym:"USD/CHF", name:"USD/CHF",       icon:"🇨🇭", cat:"Forex",    cg:null,           stooq:"usdchf" },
-  { id:"audusd", sym:"AUD/USD", name:"AUD/USD",       icon:"🇦🇺", cat:"Forex",    cg:null,           stooq:"audusd" },
-  { id:"usdcad", sym:"USD/CAD", name:"USD/CAD",       icon:"🇨🇦", cat:"Forex",    cg:null,           stooq:"usdcad" },
+  { id:"eurusd", sym:"EUR/USD", name:"EUR/USD",       icon:"💶", cat:"Forex",     cg:null,           stooq:"eurusd", binance:null, td:"EUR/USD", yahoo:"EURUSD=X" },
+  { id:"gbpusd", sym:"GBP/USD", name:"GBP/USD",       icon:"💷", cat:"Forex",     cg:null,           stooq:"gbpusd", binance:null, td:"GBP/USD", yahoo:"GBPUSD=X" },
+  { id:"usdjpy", sym:"USD/JPY", name:"USD/JPY",       icon:"¥",  cat:"Forex",     cg:null,           stooq:"usdjpy", binance:null, td:"USD/JPY", yahoo:"USDJPY=X" },
+  { id:"usdchf", sym:"USD/CHF", name:"USD/CHF",       icon:"🇨🇭", cat:"Forex",    cg:null,           stooq:"usdchf", binance:null, td:"USD/CHF", yahoo:"USDCHF=X" },
+  { id:"audusd", sym:"AUD/USD", name:"AUD/USD",       icon:"🇦🇺", cat:"Forex",    cg:null,           stooq:"audusd", binance:null, td:"AUD/USD", yahoo:"AUDUSD=X" },
+  { id:"usdcad", sym:"USD/CAD", name:"USD/CAD",       icon:"🇨🇦", cat:"Forex",    cg:null,           stooq:"usdcad", binance:null, td:"USD/CAD", yahoo:"USDCAD=X" },
 ];
 
 const BASE_PRICES = {
-  btc:67420, eth:3580, bnb:420, sol:145, xrp:0.52,
-  wti:78, gold:2341, silver:27.85, spy:524, qqq:448, gld:218,
-  eurusd:1.0842, gbpusd:1.268,
+  btc:67420, eth:3580, bnb:420, sol:145, xrp:0.52, ada:0.45, doge:0.12,
+  avax:35, dot:6.5, link:14,
+  wti:78, gold:2341, silver:27.85, spy:524, qqq:448, gld:218, iwm:215, tlt:92, xle:88,
+  eurusd:1.0842, gbpusd:1.268, usdjpy:151.5, usdchf:0.88, audusd:0.66, usdcad:1.36,
 };
 
 let priceCache  = {};
@@ -48,8 +55,11 @@ let initialized = false;
 
 // ── Saúde das fontes de preço (para o health check na app) ──────────────────
 const sourceHealth = {
-  stooq:     { ok: null, lastOk: 0, lastErr: null },
-  coingecko: { ok: null, lastOk: 0, lastErr: null },
+  binance:    { ok: null, lastOk: 0, lastErr: null },
+  coingecko:  { ok: null, lastOk: 0, lastErr: null },
+  twelvedata: { ok: null, lastOk: 0, lastErr: null },
+  stooq:      { ok: null, lastOk: 0, lastErr: null },
+  yahoo:      { ok: null, lastOk: 0, lastErr: null },
 };
 function getSourceHealth() { return sourceHealth; }
 
@@ -113,10 +123,108 @@ async function fetchCoinGecko() {
   logger.info(`CoinGecko: ${cgAssets.length} preços ✓`);
 }
 
+// ── Helpers de cache/frescura ───────────────────────────────────────────────
+function dec(asset) { return asset.cat === "Forex" ? 5 : 2; }
+function isStale(id, maxAgeMs = 90000) {
+  const c = priceCache[id];
+  return !c || (Date.now() - c.ts) > maxAgeMs;
+}
+function setPrice(asset, price, change) {
+  if (change == null) {
+    const prev = prevPrices[asset.id] || price;
+    change = prev > 0 ? ((price - prev) / prev) * 100 : 0;
+  }
+  priceCache[asset.id] = {
+    price:  +(+price).toFixed(dec(asset)),
+    change: +(+change).toFixed(3),
+    ts:     Date.now(),
+  };
+}
+// Deteção de salto irrealista (não bloqueia, só regista para diagnóstico).
+function flagOutliers() {
+  ASSETS.forEach(a => {
+    const cur = priceCache[a.id]?.price, prev = prevPrices[a.id];
+    if (!cur || !prev) return;
+    const jump = Math.abs((cur - prev) / prev) * 100;
+    const limit = a.cat === "Crypto" ? 15 : a.cat === "Forex" ? 2 : 8;
+    if (jump > limit) logger.warn(`⚠ Salto suspeito ${a.sym}: ${prev} → ${cur} (${jump.toFixed(1)}%)`);
+  });
+}
+
+// ── Binance (crypto, primário) — público, sem chave, baixa latência ─────────
+async function fetchBinance() {
+  const cryptos = ASSETS.filter(a => a.binance);
+  const symbols = JSON.stringify(cryptos.map(a => a.binance));
+  const url = `https://api.binance.com/api/v3/ticker/24hr?symbols=${encodeURIComponent(symbols)}`;
+  const r = await fetchWithRetry(url, { headers: { Accept: "application/json" } });
+  if (!r.ok) throw new Error(`Binance ${r.status}`);
+  const data = await r.json();
+  const bySym = {}; data.forEach(d => { bySym[d.symbol] = d; });
+  let ok = 0;
+  cryptos.forEach(a => {
+    const d = bySym[a.binance]; if (!d) return;
+    const price = parseFloat(d.lastPrice); if (isNaN(price)) return;
+    priceCache[a.id] = {
+      price, change: +parseFloat(d.priceChangePercent || 0).toFixed(3), ts: Date.now(),
+    };
+    ok++;
+  });
+  logger.info(`Binance: ${ok}/${cryptos.length} preços ✓`);
+  if (ok === 0) throw new Error("Binance devolveu 0 preços");
+}
+
+// ── TwelveData (forex + commodity + ETF, primário) — precisa de chave grátis ─
+async function fetchTwelveData() {
+  if (!TWELVE_KEY) return; // sem chave salta silenciosamente
+  const wanted = ASSETS.filter(a => a.td && isStale(a.id));
+  if (!wanted.length) return;
+  const symbols = wanted.map(a => a.td).join(",");
+  const url = `https://api.twelvedata.com/quote?symbol=${encodeURIComponent(symbols)}&apikey=${TWELVE_KEY}`;
+  const r = await fetchWithRetry(url, { headers: { Accept: "application/json" } });
+  if (!r.ok) throw new Error(`TwelveData ${r.status}`);
+  const data = await r.json();
+  const entries = wanted.length === 1 ? { [wanted[0].td]: data } : data;
+  let ok = 0;
+  wanted.forEach(a => {
+    const q = entries[a.td];
+    if (!q || q.status === "error" || q.code) return;
+    const price = parseFloat(q.close ?? q.price); if (isNaN(price)) return;
+    const change = parseFloat(q.percent_change ?? 0);
+    setPrice(a, price, isNaN(change) ? null : change);
+    ok++;
+  });
+  if (ok > 0) logger.info(`TwelveData: ${ok}/${wanted.length} preços ✓`);
+  else if (wanted.length) throw new Error("TwelveData devolveu 0 preços úteis");
+}
+
+// ── Yahoo Finance (ETF + commodity, último recurso antes da cache) ──────────
+async function fetchYahoo() {
+  const wanted = ASSETS.filter(a => a.yahoo && a.cat !== "Forex" && isStale(a.id));
+  if (!wanted.length) return;
+  const symbols = wanted.map(a => a.yahoo).join(",");
+  const url = `https://query1.finance.yahoo.com/v7/finance/quote?symbols=${encodeURIComponent(symbols)}`;
+  const r = await fetchWithRetry(url, {
+    headers: { "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)", Accept: "application/json" },
+  });
+  if (!r.ok) throw new Error(`Yahoo ${r.status}`);
+  const data = await r.json();
+  const rows = data?.quoteResponse?.result || [];
+  const bySym = {}; rows.forEach(q => { bySym[q.symbol] = q; });
+  let ok = 0;
+  wanted.forEach(a => {
+    const q = bySym[a.yahoo]; if (!q) return;
+    const price = parseFloat(q.regularMarketPrice); if (isNaN(price)) return;
+    setPrice(a, price, parseFloat(q.regularMarketChangePercent || 0));
+    ok++;
+  });
+  if (ok > 0) logger.info(`Yahoo: ${ok}/${wanted.length} preços ✓`);
+}
+
 // ── Stooq (commodities/ETFs/forex) — CSV, funciona em datacenters ──────────
 // Formato CSV: Symbol,Date,Time,Open,High,Low,Close,Volume
 async function fetchStooq() {
-  const stooqAssets = ASSETS.filter(a => a.stooq);
+  const stooqAssets = ASSETS.filter(a => a.stooq && isStale(a.id));
+  if (!stooqAssets.length) return;
   const symbols     = stooqAssets.map(a => a.stooq).join(",");
   // Stooq aceita múltiplos símbolos: https://stooq.com/q/l/?s=SYM1,SYM2&f=sd2t2ohlcv&h&e=csv
   const url = `https://stooq.com/q/l/?s=${symbols}&f=sd2t2ohlcv&h&e=csv`;
@@ -144,32 +252,45 @@ async function fetchStooq() {
   logger.info(`Stooq: ${stooqAssets.length} preços ✓`);
 }
 
-// ── Refresh all ─────────────────────────────────────────────────────────────
+// ── Refresh all — orquestra o fallback em cascata ───────────────────────────
 async function refreshAll() {
   if (!initialized) {
     Object.entries(BASE_PRICES).forEach(([id, p]) => {
-      if (!priceCache[id]) priceCache[id] = { price: p, change: 0, ts: Date.now() };
+      if (!priceCache[id]) priceCache[id] = { price: p, change: 0, ts: 0 };
     });
     initialized = true;
   }
 
-  // Guardar preços atuais como "anteriores" para cálculo de change
+  // Snapshot dos preços atuais (para change/outliers no fim).
   Object.entries(priceCache).forEach(([id, d]) => { prevPrices[id] = d.price; });
 
-  const results = await Promise.allSettled([fetchCoinGecko(), fetchStooq()]);
-  const names   = ["coingecko", "stooq"];
-  results.forEach((res, i) => {
-    const src = sourceHealth[names[i]];
+  const track = (name, res) => {
+    const src = sourceHealth[name];
+    if (!src) return;
     if (res.status === "rejected") {
-      src.ok = false;
-      src.lastErr = res.reason?.message || String(res.reason);
-      logger.warn(`Price feed ${names[i]} falhou: ${src.lastErr} (a usar cache)`);
-    } else {
-      src.ok = true;
-      src.lastOk = Date.now();
-      src.lastErr = null;
-    }
-  });
+      src.ok = false; src.lastErr = res.reason?.message || String(res.reason);
+      logger.warn(`Price feed ${name} falhou: ${src.lastErr} (a usar próxima fonte/cache)`);
+    } else { src.ok = true; src.lastOk = Date.now(); src.lastErr = null; }
+  };
+
+  // 1) Crypto: Binance primeiro; CoinGecko cobre buracos.
+  track("binance", (await Promise.allSettled([fetchBinance()]))[0]);
+  track("coingecko", (await Promise.allSettled([fetchCoinGecko()]))[0]);
+
+  // 2) Forex/ETF/Commodity: TwelveData primeiro (se houver chave).
+  track("twelvedata", (await Promise.allSettled([fetchTwelveData()]))[0]);
+
+  // 3) Fallbacks para o que ainda estiver stale: Stooq e Yahoo.
+  const [stooqRes, yahooRes] = await Promise.allSettled([fetchStooq(), fetchYahoo()]);
+  track("stooq", stooqRes);
+  track("yahoo", yahooRes);
+
+  // 4) Diagnóstico de outliers (não bloqueia).
+  flagOutliers();
+
+  // 5) Relatório do que ficou só em cache/base.
+  const stale = ASSETS.filter(a => isStale(a.id, 120000)).map(a => a.sym);
+  if (stale.length) logger.warn(`A usar cache/base para: ${stale.join(", ")}`);
 }
 
 function getPrice(assetId) { return priceCache[assetId]?.price || BASE_PRICES[assetId] || null; }
