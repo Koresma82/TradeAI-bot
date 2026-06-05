@@ -147,11 +147,16 @@ async function checkSLTP(currentPrices) {
       reason = "AI-EXIT"; closePrice = price;
     }
     else if (price <= pos.sl) {
-      reason = (trailingOn && pos.sl > pos.entryPrice) ? "TRAIL" : "SL";
-      // Fecha ao preço REAL de mercado, não ao SL teórico. Quando o preço salta
-      // para lá do SL, fechas onde o mercado está — isto reflete o slippage real
-      // e evita que a simulação pareça melhor do que o paper/real será.
-      closePrice = Math.min(price, pos.sl);
+      // Carência de SL para posições MANUAIS: nos primeiros 60s não fecha por SL,
+      // evitando o fecho-relâmpago logo após a compra manual (cripto volátil).
+      const manualGrace = pos.stratId === "manual" && idadeMs < 60000;
+      if (!manualGrace) {
+        reason = (trailingOn && pos.sl > pos.entryPrice) ? "TRAIL" : "SL";
+        // Fecha ao preço REAL de mercado, não ao SL teórico. Quando o preço salta
+        // para lá do SL, fechas onde o mercado está — isto reflete o slippage real
+        // e evita que a simulação pareça melhor do que o paper/real será.
+        closePrice = Math.min(price, pos.sl);
+      }
     }
     else if (!onHold && price >= pos.tp) {
       reason = "TP";
@@ -536,9 +541,11 @@ async function tick() {
       const ph = prices.getSourceHealth();
       const gh = aiSignals.getGroqHealth();
       const apiHealth = {
-        groq:      { ok: gh.ok, rateLimited: gh.rateLimited, untilMs: gh.untilMs },
-        stooq:     { ok: ph.stooq.ok,     lastOk: ph.stooq.lastOk,     err: ph.stooq.lastErr },
-        coingecko: { ok: ph.coingecko.ok, lastOk: ph.coingecko.lastOk, err: ph.coingecko.lastErr },
+        groq:       { ok: gh.ok, rateLimited: gh.rateLimited, untilMs: gh.untilMs },
+        binance:    { ok: ph.binance?.ok,    lastOk: ph.binance?.lastOk,    err: ph.binance?.lastErr },
+        coingecko:  { ok: ph.coingecko.ok,   lastOk: ph.coingecko.lastOk,   err: ph.coingecko.lastErr },
+        twelvedata: { ok: ph.twelvedata?.ok, lastOk: ph.twelvedata?.lastOk, err: ph.twelvedata?.lastErr },
+        stooq:      { ok: ph.stooq.ok,       lastOk: ph.stooq.lastOk,       err: ph.stooq.lastErr },
       };
       await fb.saveSetting("server", "botStatus", {
         alive:    true,
