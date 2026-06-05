@@ -5,19 +5,35 @@
 const logger = require("./logger");
 
 const ASSETS = [
-  { id:"btc",    sym:"BTC",     cat:"Crypto",    cg:"bitcoin",      stooq:null         },
-  { id:"eth",    sym:"ETH",     cat:"Crypto",    cg:"ethereum",     stooq:null         },
-  { id:"bnb",    sym:"BNB",     cat:"Crypto",    cg:"binancecoin",  stooq:null         },
-  { id:"sol",    sym:"SOL",     cat:"Crypto",    cg:"solana",       stooq:null         },
-  { id:"xrp",    sym:"XRP",     cat:"Crypto",    cg:"ripple",       stooq:null         },
-  { id:"wti",    sym:"WTI",     cat:"Commodity", cg:null,           stooq:"cl.f"       },
-  { id:"gold",   sym:"XAU",     cat:"Commodity", cg:null,           stooq:"gc.f"       },
-  { id:"silver", sym:"XAG",     cat:"Commodity", cg:null,           stooq:"si.f"       },
-  { id:"spy",    sym:"SPY",     cat:"ETF",       cg:null,           stooq:"spy.us"     },
-  { id:"qqq",    sym:"QQQ",     cat:"ETF",       cg:null,           stooq:"qqq.us"     },
-  { id:"gld",    sym:"GLD",     cat:"ETF",       cg:null,           stooq:"gld.us"     },
-  { id:"eurusd", sym:"EUR/USD", cat:"Forex",     cg:null,           stooq:"eurusd"     },
-  { id:"gbpusd", sym:"GBP/USD", cat:"Forex",     cg:null,           stooq:"gbpusd"     },
+  // ── Crypto (CoinGecko, 24/7) ──
+  { id:"btc",    sym:"BTC",     name:"Bitcoin",       icon:"₿",  cat:"Crypto",    cg:"bitcoin",      stooq:null     },
+  { id:"eth",    sym:"ETH",     name:"Ethereum",      icon:"Ξ",  cat:"Crypto",    cg:"ethereum",     stooq:null     },
+  { id:"bnb",    sym:"BNB",     name:"BNB",           icon:"🔶", cat:"Crypto",    cg:"binancecoin",  stooq:null     },
+  { id:"sol",    sym:"SOL",     name:"Solana",        icon:"◎",  cat:"Crypto",    cg:"solana",       stooq:null     },
+  { id:"xrp",    sym:"XRP",     name:"XRP",           icon:"✕",  cat:"Crypto",    cg:"ripple",       stooq:null     },
+  { id:"ada",    sym:"ADA",     name:"Cardano",       icon:"₳",  cat:"Crypto",    cg:"cardano",      stooq:null     },
+  { id:"doge",   sym:"DOGE",    name:"Dogecoin",      icon:"🐕", cat:"Crypto",    cg:"dogecoin",     stooq:null     },
+  { id:"avax",   sym:"AVAX",    name:"Avalanche",     icon:"🔺", cat:"Crypto",    cg:"avalanche-2",  stooq:null     },
+  { id:"dot",    sym:"DOT",     name:"Polkadot",      icon:"⬤",  cat:"Crypto",    cg:"polkadot",     stooq:null     },
+  { id:"link",   sym:"LINK",    name:"Chainlink",     icon:"⬡",  cat:"Crypto",    cg:"chainlink",    stooq:null     },
+  // ── Commodities (Stooq, horário de mercado) ──
+  { id:"wti",    sym:"WTI",     name:"Petróleo WTI",  icon:"🛢", cat:"Commodity", cg:null,           stooq:"cl.f"   },
+  { id:"gold",   sym:"XAU",     name:"Ouro",          icon:"🥇", cat:"Commodity", cg:null,           stooq:"gc.f"   },
+  { id:"silver", sym:"XAG",     name:"Prata",         icon:"🥈", cat:"Commodity", cg:null,           stooq:"si.f"   },
+  // ── ETFs (Stooq, horário de mercado) ──
+  { id:"spy",    sym:"SPY",     name:"S&P 500 ETF",   icon:"📈", cat:"ETF",       cg:null,           stooq:"spy.us" },
+  { id:"qqq",    sym:"QQQ",     name:"Nasdaq ETF",    icon:"💻", cat:"ETF",       cg:null,           stooq:"qqq.us" },
+  { id:"gld",    sym:"GLD",     name:"Gold ETF",      icon:"🏅", cat:"ETF",       cg:null,           stooq:"gld.us" },
+  { id:"iwm",    sym:"IWM",     name:"Russell 2000",  icon:"📊", cat:"ETF",       cg:null,           stooq:"iwm.us" },
+  { id:"tlt",    sym:"TLT",     name:"US Bonds ETF",  icon:"📋", cat:"ETF",       cg:null,           stooq:"tlt.us" },
+  { id:"xle",    sym:"XLE",     name:"Energy ETF",    icon:"⚡", cat:"ETF",       cg:null,           stooq:"xle.us" },
+  // ── Forex (Stooq, dias úteis) ──
+  { id:"eurusd", sym:"EUR/USD", name:"EUR/USD",       icon:"💶", cat:"Forex",     cg:null,           stooq:"eurusd" },
+  { id:"gbpusd", sym:"GBP/USD", name:"GBP/USD",       icon:"💷", cat:"Forex",     cg:null,           stooq:"gbpusd" },
+  { id:"usdjpy", sym:"USD/JPY", name:"USD/JPY",       icon:"¥",  cat:"Forex",     cg:null,           stooq:"usdjpy" },
+  { id:"usdchf", sym:"USD/CHF", name:"USD/CHF",       icon:"🇨🇭", cat:"Forex",    cg:null,           stooq:"usdchf" },
+  { id:"audusd", sym:"AUD/USD", name:"AUD/USD",       icon:"🇦🇺", cat:"Forex",    cg:null,           stooq:"audusd" },
+  { id:"usdcad", sym:"USD/CAD", name:"USD/CAD",       icon:"🇨🇦", cat:"Forex",    cg:null,           stooq:"usdcad" },
 ];
 
 const BASE_PRICES = {

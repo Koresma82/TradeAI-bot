@@ -20,6 +20,7 @@ let strategies    = [];
 let openPositions = {};  // { posId: { ...position } }
 let priceHistory  = {};  // { assetId: [{ price, ts }] } — intradiário (curto prazo)
 let dailySeries   = {};  // { assetId: [fechos diários] } — para indicadores (RSI/MM)
+let noPriceWarned = {};  // { assetId: ts } — controlo de avisos "sem preço"
 let lastBuyTime   = {};  // cooldown por estratégia/ativo
 let tickCount     = 0;
 let totalInvested = 0;
@@ -49,8 +50,10 @@ let appSettings   = {
 let dtConfig = null; // config de day trading lida da app (dtState)
 let simBalance    = parseFloat(process.env.SIM_CAPITAL || "1000");
 let simCapital    = simBalance;
-// Ativos negociáveis (o cérebro AI só compra estes)
-const TRADEABLE = new Set(["btc","eth","wti","gold","silver","spy","qqq","gld","eurusd","gbpusd"]);
+// Ativos negociáveis: derivados da lista do prices.js (fonte única de verdade).
+// Todos têm fonte de preço real (CoinGecko ou Stooq), por isso o bot consegue
+// mesmo negociá-los. A app lê esta lista publicada no Firestore.
+const TRADEABLE = new Set(prices.ASSETS.map(a => a.id));
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 const sign = v => v >= 0 ? "+" : "−";
@@ -95,7 +98,17 @@ async function checkSLTP(currentPrices) {
 
   for (const [posId, pos] of Object.entries(openPositions)) {
     const price = currentPrices[pos.assetId]?.price;
-    if (!price) continue;
+    if (!price) {
+      // Posição aberta sem preço atual (fonte falhou ou ativo removido).
+      // Não a perdemos — fica aberta e gerida assim que o preço voltar.
+      // Avisa 1x por hora para não encher os logs.
+      const k = `nopx_${pos.assetId}`;
+      if (!noPriceWarned[k] || Date.now() - noPriceWarned[k] > 3600000) {
+        logger.warn(`⚠ Sem preço para ${pos.assetSym || pos.assetId} (posição aberta continua segura, à espera de preço)`);
+        noPriceWarned[k] = Date.now();
+      }
+      continue;
+    }
 
     // ── Trailing stop: sobe o SL atrás do pico quando há lucro ──
     if (trailingOn) {
@@ -119,11 +132,18 @@ async function checkSLTP(currentPrices) {
     //    sempre (proteção contra perdas). ──
     const onHold = pos.hold === true;
 
+    // ── Tempo mínimo de vida: o AI-EXIT não pode fechar uma posição nos
+    //    primeiros 2 minutos. Evita que uma compra (manual ou AI) seja fechada
+    //    de imediato por um sinal de VENDER que já estava ativo. O SL/TP não
+    //    são afetados por isto (a proteção contra perdas é sempre imediata). ──
+    const idadeMs = pos.openedTs ? (Date.now() - pos.openedTs) : Infinity;
+    const podeAiExit = idadeMs >= 120000; // 2 min
+
     // ── Saída antecipada se a IA virar para VENDER com confiança ──
     // Só fecha SE houver lucro (a função é "proteger ganhos", não sair a zero/perda).
     const sg = aiSignals.getSignal(pos.assetId);
     const emLucro = price > pos.entryPrice;
-    if (!onHold && exitOnFlip && sg && sg.sinal === "VENDER" && (sg.confianca || 0) >= flipConf && emLucro && price > pos.sl) {
+    if (!onHold && podeAiExit && exitOnFlip && sg && sg.sinal === "VENDER" && (sg.confianca || 0) >= flipConf && emLucro && price > pos.sl) {
       reason = "AI-EXIT"; closePrice = price;
     }
     else if (price <= pos.sl) {
@@ -250,7 +270,7 @@ async function executeBuy(strategy, assetId, price) {
     sl, tp,
     strategy:    strategy.nome,
     stratId:     strategy.id,
-    openedAt:    new Date().toLocaleTimeString("pt-PT"),
+    openedAt:    new Date().toLocaleTimeString("pt-PT"), openedTs: Date.now(),
     status:      "ABERTA",
     mode:        broker.isLive() ? "live" : "sim",
     brokerOrderId: exec.brokerOrderId || null,
@@ -289,7 +309,7 @@ async function openDayTrade({ assetId, assetName, assetSym, price, amount, sl, t
     entryPrice: price, units, amount: amt, peak: price, sl, tp,
     strategy: `⚡ DayTrade${confianca ? ` (${confianca}%)` : ""}${previsao ? ` — ${String(previsao).slice(0,40)}` : ""}`,
     stratId: "daytrading",
-    openedAt: new Date().toLocaleTimeString("pt-PT"), status: "ABERTA", mode: "sim",
+    openedAt: new Date().toLocaleTimeString("pt-PT"), openedTs: Date.now(), status: "ABERTA", mode: "sim",
   };
   openPositions[posId] = position;
   totalInvested += amt;
@@ -355,7 +375,7 @@ async function runAiBrain(currentPrices) {
       id: posId, assetId: sg.id, assetName: sg.id, assetSym: sg.id.toUpperCase(),
       entryPrice: price, units, amount: perTrade, peak: price, sl, tp,
       strategy: `🤖 AI Brain (${sg.confianca}%)`, stratId: "ai-brain",
-      openedAt: new Date().toLocaleTimeString("pt-PT"), status: "ABERTA", mode: "sim",
+      openedAt: new Date().toLocaleTimeString("pt-PT"), openedTs: Date.now(), status: "ABERTA", mode: "sim",
     };
     openPositions[posId] = position;
     totalInvested += perTrade;
@@ -678,6 +698,17 @@ async function init() {
   // Primeiro fetch de preços
   await prices.refreshAll();
   logger.info("Preços inicializados ✓");
+
+  // Publicar a lista de ativos negociáveis para a app (sync app↔bot)
+  try {
+    const lista = prices.ASSETS.map(a => ({
+      id: a.id, sym: a.sym, name: a.name, icon: a.icon, cat: a.cat,
+    }));
+    await fb.publishTradeableAssets(lista);
+    logger.info(`📡 ${lista.length} ativos negociáveis publicados para a app`);
+  } catch (e) {
+    logger.warn(`Falha a publicar ativos: ${e.message}`);
+  }
 
   // Carregar histórico diário para os indicadores (RSI, médias móveis)
   try {

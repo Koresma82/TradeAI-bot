@@ -153,6 +153,16 @@ function watchSetting(key, callback) {
   }, () => {});
 }
 
+// ── Publicar a lista de ativos negociáveis (sync app↔bot) ──────────────────
+// O bot é a fonte de verdade: só publica ativos que consegue mesmo negociar
+// (têm fonte de preço). A app lê isto para só deixar criar estratégias válidas.
+async function publishTradeableAssets(assets) {
+  await userDoc("settings", "tradeableAssets").set({
+    value: assets,
+    updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+  });
+}
+
 // ── Vigiar trades abertos (apanha compras MANUAIS feitas na app em tempo real) ──
 // O bot só carregava posições no arranque; sem isto, uma compra manual na app
 // só seria gerida (SL/TP) após um restart. Agora o bot apanha-as logo.
@@ -253,6 +263,7 @@ module.exports = {
   saveTrade,
   loadOpenPositions,
   watchOpenTrades,
+  publishTradeableAssets,
   updateTrade,
   saveSetting,
   saveStats,
