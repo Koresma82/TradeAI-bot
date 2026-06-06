@@ -7,6 +7,9 @@
 const logger = require("./logger");
 
 const TWELVE_KEY = process.env.TWELVEDATA_KEY || "";
+// Domínio de dados da Binance (público, sem 451 em datacenters). Override via env.
+const BINANCE_DATA = process.env.BINANCE_DATA_URL || "https://data-api.binance.vision";
+let binanceBlocked = false; // se der 451, deixa de tentar nesta execução
 
 const ASSETS = [
   // ── Crypto (CoinGecko, 24/7) ──
@@ -145,12 +148,17 @@ function flagOutliers() {
   });
 }
 
-// ── Binance (crypto, primário) — público, sem chave ─────────────────────────
+// ── Binance (crypto, primário) — domínio de DADOS, sem 451 em datacenters ───
 async function fetchBinance() {
+  if (binanceBlocked) return; // já deu 451 nesta execução; não insistir
   const cryptos = ASSETS.filter(a => a.binance);
   const symbols = JSON.stringify(cryptos.map(a => a.binance));
-  const url = `https://api.binance.com/api/v3/ticker/24hr?symbols=${encodeURIComponent(symbols)}`;
+  const url = `${BINANCE_DATA}/api/v3/ticker/24hr?symbols=${encodeURIComponent(symbols)}`;
   const r = await fetchWithRetry(url, { headers: { Accept: "application/json" } });
+  if (r.status === 451 || r.status === 403) {
+    binanceBlocked = true; // região bloqueada — CoinGecko assume a crypto
+    throw new Error(`Binance ${r.status} (região bloqueada — a usar CoinGecko)`);
+  }
   if (!r.ok) throw new Error(`Binance ${r.status}`);
   const data = await r.json();
   const bySym = {}; data.forEach(d => { bySym[d.symbol] = d; });
@@ -165,14 +173,39 @@ async function fetchBinance() {
   if (ok === 0) throw new Error("Binance devolveu 0 preços");
 }
 
-// ── TwelveData (forex/ETF/commodity, primário) — precisa de chave grátis ─────
+// ── TwelveData (forex/ETF/commodity, primário) ──────────────────────────────
+// Cobra 1 crédito POR SÍMBOLO. Plano grátis: 800/dia, 8 CRÉDITOS/min.
+// Por isso: ≤6 símbolos por chamada, ≤1 chamada/min (≤6 créditos/min < 8), e
+// orçamento diário. Ao esgotar, o Stooq cobre o resto do dia.
+const TD_DAILY_BUDGET = parseInt(process.env.TWELVEDATA_DAILY_BUDGET || "700");
+const TD_MIN_INTERVAL = 60000; // 1 chamada por minuto
+const TD_MAX_SYMBOLS  = 6;     // ≤6 símbolos/chamada
+let tdCreditsToday = 0, tdDayKey = "", tdLastCall = 0;
+function tdResetIfNewDay() {
+  const today = new Date().toISOString().slice(0, 10);
+  if (today !== tdDayKey) { tdDayKey = today; tdCreditsToday = 0; }
+}
+
 async function fetchTwelveData() {
   if (!TWELVE_KEY) return;
-  const wanted = ASSETS.filter(a => a.td && isStale(a.id));
+  tdResetIfNewDay();
+  const now = Date.now();
+  if (now - tdLastCall < TD_MIN_INTERVAL) return;
+  if (tdCreditsToday >= TD_DAILY_BUDGET) {
+    if (tdCreditsToday === TD_DAILY_BUDGET) logger.warn(`TwelveData: orçamento diário (${TD_DAILY_BUDGET}) atingido — Stooq assume até amanhã`);
+    return;
+  }
+  // Só ativos stale há >4min (mexem devagar), no máx TD_MAX_SYMBOLS, mais antigos 1º.
+  const wanted = ASSETS.filter(a => a.td && isStale(a.id, 240000))
+    .sort((x, y) => (priceCache[x.id]?.ts || 0) - (priceCache[y.id]?.ts || 0))
+    .slice(0, TD_MAX_SYMBOLS);
   if (!wanted.length) return;
+  tdLastCall = now;
+  tdCreditsToday += wanted.length;
   const symbols = wanted.map(a => a.td).join(",");
   const url = `https://api.twelvedata.com/quote?symbol=${encodeURIComponent(symbols)}&apikey=${TWELVE_KEY}`;
   const r = await fetchWithRetry(url, { headers: { Accept: "application/json" } });
+  if (r.status === 429) { tdCreditsToday = TD_DAILY_BUDGET; throw new Error("TwelveData 429 (limite) — Stooq assume"); }
   if (!r.ok) throw new Error(`TwelveData ${r.status}`);
   const data = await r.json();
   const entries = wanted.length === 1 ? { [wanted[0].td]: data } : data;

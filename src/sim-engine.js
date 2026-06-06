@@ -31,10 +31,14 @@ let lastSimLiveAt      = 0;    // timestamp da última escrita de simLive
 let lastHeartbeatAt    = 0;    // timestamp do último botStatus escrito
 let lastFeaturesJson   = "";   // últimas features escritas no botStatus
 const SIMLIVE_MIN_MS   = 60 * 1000;       // no máx. 1 escrita de simLive por minuto
+const PRICES_PUB_MS    = 2 * 60 * 1000;   // publica preços p/ a app a cada 2 min
+let lastPricesAt       = 0;
 const HEARTBEAT_MS     = 2 * 60 * 1000;   // heartbeat a cada 2 min (app exige < 3 min)
 // Definições lidas do Firestore (a app controla isto)
 let appSettings   = {
   maxEstrategias: 5,
+  riscoPerfil: "moderado",
+  modoValor: "fixo",
   rotacaoAtiva: false,
   // Automação avançada com IA
   aiBrain: false,
@@ -202,9 +206,40 @@ async function checkSLTP(currentPrices) {
   }
 }
 
+// ── Sugestão de quantia a investir — perfil de risco + confiança + saldo ──────
+// Espelha a lógica da app. Em sim usa o saldo da simulação; em paper/live usaria
+// o saldo do broker (via broker.getBalance, mas mantemos simples e seguro aqui).
+function suggestAmount(assetId, confianca, strategy) {
+  const avail = simBalance;
+  if (!avail || avail <= 0) return strategy.perTrade || 10;
+
+  // Modo "fixo": respeita o valor fixo da estratégia/definições (comportamento clássico).
+  if (appSettings.modoValor !== "percentagem") {
+    return Math.min(strategy.perTrade || appSettings.valorFixo || 10, avail);
+  }
+
+  // Modo "% da Banca": dimensiona pelo perfil de risco + confiança + saldo.
+  const PERFIL = {
+    conservador: { teto: 0.10, base: 0.04 },
+    moderado:    { teto: 0.20, base: 0.08 },
+    agressivo:   { teto: 0.33, base: 0.14 },
+  };
+  const cfg = PERFIL[appSettings.riscoPerfil] || PERFIL.moderado;
+  const c = Math.max(0, Math.min(100, confianca || 0));
+  const mult = c >= 90 ? 2.0 : c >= 80 ? 1.5 : c >= 70 ? 1.1 : c >= 60 ? 0.8 : 0.5;
+  // Base: a % da banca definida nas Definições, escalada pela confiança, com teto do perfil.
+  const pctBase = (appSettings.percentagem || 3) / 100;
+  let amount = avail * pctBase * mult;
+  amount = Math.min(amount, avail * cfg.teto);
+  amount = Math.max(10, Math.min(amount, avail));
+  return +amount.toFixed(2);
+}
+
 // ── Executar compra simulada ──────────────────────────────────────────────────
-async function executeBuy(strategy, assetId, price) {
-  const amount = Math.min(strategy.perTrade, parseFloat(process.env.MAX_POSITION_EUR || "500"));
+async function executeBuy(strategy, assetId, price, confianca) {
+  // Quantia: por perfil+confiança+saldo se modoInvestimento="auto", senão fixo.
+  const sized  = suggestAmount(assetId, confianca, strategy);
+  const amount = Math.min(sized, parseFloat(process.env.MAX_POSITION_EUR || "500"));
 
   if (simBalance < amount) {
     logger.warn(`Saldo insuficiente: €${simBalance} < €${amount}`);
@@ -334,7 +369,6 @@ async function runAiBrain(currentPrices) {
   if (!appSettings.aiBrain || dailyLossHit) return;
   const minConf  = appSettings.aiBrainConfianca || 78;
   const maxStrat = appSettings.maxEstrategias || 5;
-  const perTrade = Math.min(appSettings.valorFixo || 100, parseFloat(process.env.MAX_POSITION_EUR || "500"));
   const slPct    = appSettings.stopLossPadrao || 6;
   const tpPct    = appSettings.takeProfitPadrao || 12;
 
@@ -369,6 +403,11 @@ async function runAiBrain(currentPrices) {
     const brainPositions = Object.values(openPositions).filter(p => p.stratId === "ai-brain");
     const allStratPos = Object.values(openPositions).filter(p => p.stratId !== "manual" && p.stratId !== "daytrading");
     if (allStratPos.length >= maxStrat) continue;
+    // Quantia por perfil+confiança+saldo (igual à app); fixo se modo != auto.
+    const perTrade = Math.min(
+      suggestAmount(sg.id, sg.confianca, { perTrade: appSettings.valorFixo || 100 }),
+      parseFloat(process.env.MAX_POSITION_EUR || "500")
+    );
     if (simBalance < perTrade) continue;
     if (totalInvested + perTrade > parseFloat(process.env.MAX_TOTAL_EUR || simCapital)) continue;
 
@@ -465,7 +504,11 @@ async function tick() {
           if (sinal.buy) {
             logger.info(`🎯 Sinal: ${strategy.nome} → ${assetId} | ${sinal.reason} (força ${sinal.score})`);
             const before = Object.keys(openPositions).length;
-            await executeBuy(strategy, assetId, priceData.price);
+            // Confiança para o sizing: usa o score do sinal técnico, reforçado pela
+            // confiança da IA para o ativo se existir e for maior.
+            const aiSig = aiSignals.getSignal(assetId);
+            const conf  = Math.max(sinal.score || 0, aiSig?.confianca || 0);
+            await executeBuy(strategy, assetId, priceData.price, conf);
             if (Object.keys(openPositions).length > before) lastBuyTime[cdKey] = Date.now();
           }
         }
@@ -526,6 +569,19 @@ async function tick() {
       });
       lastSimLiveJson = simLiveJson;
       lastSimLiveAt   = now;
+    }
+
+    // 4b. Publica PREÇOS no Firestore (a cada 2 min) para a app os ler em vez de
+    //     bater nas APIs ela própria — elimina chamadas duplicadas app↔bot.
+    if (now - lastPricesAt >= PRICES_PUB_MS) {
+      const all = prices.getAll();
+      const slim = {};
+      for (const a of prices.ASSETS) {
+        const d = all[a.id];
+        if (d?.price) slim[a.id] = { price: d.price, change: d.change ?? 0 };
+      }
+      await fb.saveSetting("server", "marketPrices", { prices: slim, ts: now }).catch(() => {});
+      lastPricesAt = now;
     }
 
     // 5. Heartbeat — a app usa para saber que o bot está vivo (exige < 3 min).
@@ -679,6 +735,9 @@ async function init() {
         stopLossPadrao:   val.stopLossPadrao ?? 6,
         takeProfitPadrao: val.takeProfitPadrao ?? 12,
         valorFixo:        val.valorFixo ?? 100,
+        riscoPerfil:      (val.riscoPerfil || "moderado").toLowerCase(),
+        modoValor:        val.modoValor || "fixo", // "fixo" | "percentagem"
+        percentagem:      val.percentagem ?? 3,
         maxDayTrading:    val.maxDayTrading ?? 5,
         aiSignalsMin:     val.aiSignalsMin ?? 15,
       };
