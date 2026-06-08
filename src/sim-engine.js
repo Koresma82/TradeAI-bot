@@ -183,11 +183,13 @@ async function checkSLTP(currentPrices) {
 
     logger.info(`${icon} ${reason} ${pos.assetSym} | P&L ${sign(pnl)}${eur(pnl)}`);
 
+    const closedTs = Date.now();
     const closedTrade = {
       ...pos,
       status:    reason,
       closePrice,
-      closedAt:  new Date().toLocaleTimeString("pt-PT"),
+      closedAt:  new Date().toLocaleString("pt-PT"),
+      closedTs,
       pnl,
     };
 
@@ -197,7 +199,7 @@ async function checkSLTP(currentPrices) {
     simBalance    = +(simBalance + pos.amount + pnl).toFixed(2);
 
     // Guarda no Firestore
-    await fb.updateTrade("server", posId, { status: reason, closePrice, pnl, closedAt: closedTrade.closedAt });
+    await fb.updateTrade("server", posId, { status: reason, closePrice, pnl, closedAt: closedTrade.closedAt, closedTs });
     await fb.saveBalance("server", simBalance);
     stats.addClosedTrade(closedTrade);
     dailyLossHit = stats.checkDailyLossLimit();
@@ -278,9 +280,10 @@ async function executeBuy(strategy, assetId, price, confianca) {
     delete openPositions[bestWinner.id];
     totalInvested = Math.max(0, totalInvested - bestWinner.amount);
     simBalance = +(simBalance + bestWinner.amount + bestPnl).toFixed(2);
-    await fb.updateTrade("server", bestWinner.id, { status: "ROTACAO", closePrice: cur, pnl: bestPnl, closedAt: new Date().toLocaleTimeString("pt-PT") });
+    const rotClosedTs = Date.now();
+    await fb.updateTrade("server", bestWinner.id, { status: "ROTACAO", closePrice: cur, pnl: bestPnl, closedAt: new Date().toLocaleString("pt-PT"), closedTs: rotClosedTs });
     await fb.saveBalance("server", simBalance);
-    stats.addClosedTrade({ ...bestWinner, status: "ROTACAO", closePrice: cur, pnl: bestPnl });
+    stats.addClosedTrade({ ...bestWinner, status: "ROTACAO", closePrice: cur, pnl: bestPnl, closedTs: rotClosedTs });
     logger.info(`🔄 ROTAÇÃO: fechado ${bestWinner.assetSym} (+€${bestPnl.toFixed(2)}) para abrir ${assetId}`);
   }
 
@@ -310,7 +313,7 @@ async function executeBuy(strategy, assetId, price, confianca) {
     sl, tp,
     strategy:    strategy.nome,
     stratId:     strategy.id,
-    openedAt:    new Date().toLocaleTimeString("pt-PT"), openedTs: Date.now(),
+    openedAt:    new Date().toLocaleString("pt-PT"), openedTs: Date.now(),
     status:      "ABERTA",
     mode:        broker.isLive() ? "live" : "sim",
     brokerOrderId: exec.brokerOrderId || null,
@@ -350,7 +353,7 @@ async function openDayTrade({ assetId, assetName, assetSym, price, amount, sl, t
     entryPrice: price, units, amount: amt, peak: price, sl, tp,
     strategy: `⚡ DayTrade${confianca ? ` (${confianca}%)` : ""}${previsao ? ` — ${String(previsao).slice(0,40)}` : ""}`,
     stratId: "daytrading",
-    openedAt: new Date().toLocaleTimeString("pt-PT"), openedTs: Date.now(), status: "ABERTA", mode: "sim",
+    openedAt: new Date().toLocaleString("pt-PT"), openedTs: Date.now(), status: "ABERTA", mode: "sim",
   };
   openPositions[posId] = position;
   totalInvested += amt;
@@ -420,7 +423,7 @@ async function runAiBrain(currentPrices) {
       id: posId, assetId: sg.id, assetName: sg.id, assetSym: sg.id.toUpperCase(),
       entryPrice: price, units, amount: perTrade, peak: price, sl, tp,
       strategy: `🤖 AI Brain (${sg.confianca}%)`, stratId: "ai-brain",
-      openedAt: new Date().toLocaleTimeString("pt-PT"), openedTs: Date.now(), status: "ABERTA", mode: "sim",
+      openedAt: new Date().toLocaleString("pt-PT"), openedTs: Date.now(), status: "ABERTA", mode: "sim",
     };
     openPositions[posId] = position;
     totalInvested += perTrade;

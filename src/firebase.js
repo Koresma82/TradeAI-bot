@@ -191,25 +191,66 @@ async function logError(context, error) {
   } catch (e) { /* silencioso */ }
 }
 
+// ── Data "civil" no fuso de Lisboa (YYYY-MM-DD) ──────────────────────────────
+// Usamos sempre o fuso de Portugal para decidir a que dia pertence um trade,
+// independentemente de o servidor (Railway) correr em UTC.
+function lisbonDayString(date = new Date()) {
+  return new Intl.DateTimeFormat("en-CA", {
+    timeZone: "Europe/Lisbon",
+    year: "numeric", month: "2-digit", day: "2-digit",
+  }).format(date);
+}
+
+function lisbonYesterdayString(ref = new Date()) {
+  return lisbonDayString(new Date(ref.getTime() - 86400000));
+}
+
+// ── Último dia já arquivado ───────────────────────────────────────────────────
+async function getLastArchivedDay() {
+  const snap = await userCol("archives").get();
+  if (snap.empty) return null;
+  const days = snap.docs.map(d => d.id).filter(id => /^\d{4}-\d{2}-\d{2}$/.test(id));
+  if (!days.length) return null;
+  days.sort();
+  return days[days.length - 1];
+}
+
 // ── Arquivar trades fechados do dia ──────────────────────────────────────────
-// Move todos os trades já FECHADOS para users/{uid}/archives/{dia} e remove-os
-// da coleção "trades" ativa. Mantém as posições ABERTAS intactas.
-// Devolve um resumo { dia, count, pnl, winRate } ou null se não houver nada.
+// Move os trades FECHADOS pertencentes a `day` (fuso Lisboa) para
+// users/{uid}/archives/{day} e remove-os da coleção "trades" ativa.
+// As posições ABERTAS ficam intactas. Idempotente: se o arquivo do dia já
+// existir, não duplica. `day` por defeito = ontem.
+// Devolve um resumo { day, count, pnl, winRate, ... } ou null se não houver nada.
 async function archiveClosedTrades(dateStr) {
-  // dia a arquivar: por defeito ontem (corre à meia-noite a fechar o dia anterior)
-  const day = dateStr || (() => {
-    const d = new Date();
-    d.setDate(d.getDate() - 1);
-    return d.toISOString().split("T")[0];
-  })();
+  const day = dateStr || lisbonYesterdayString();
+
+  // Idempotência: não re-arquivar um dia já arquivado.
+  const existing = await userCol("archives").doc(day).get();
+  if (existing.exists) {
+    logger.info(`Arquivo ${day}: já existe — ignorado (idempotente)`);
+    return null;
+  }
 
   // Ler trades fechados (status != ABERTA) — qualquer modo (sim/paper/live)
   const snap = await userCol("trades").where("status", "!=", "ABERTA").get();
-  const fechadas = snap.docs
-    .map(d => ({ _ref: d.ref, id: d.id, ...d.data() }));
+  const todasFechadas = snap.docs.map(d => ({ _ref: d.ref, id: d.id, ...d.data() }));
+
+  if (!todasFechadas.length) {
+    logger.info(`Arquivo ${day}: nenhum trade fechado para arquivar`);
+    return null;
+  }
+
+  // Filtrar só os que fecharam NESTE dia (fuso Lisboa). Trades antigos sem
+  // closedTs (legado) só entram quando arquivamos o dia de ontem no fluxo
+  // normal, para não ficarem presos na coleção ativa indefinidamente.
+  const ontem = lisbonYesterdayString();
+  const fechadas = todasFechadas.filter(t => {
+    if (typeof t.closedTs === "number") return lisbonDayString(new Date(t.closedTs)) === day;
+    return day === ontem; // legado
+  });
 
   if (!fechadas.length) {
-    logger.info(`Arquivo ${day}: nenhum trade fechado para arquivar`);
+    logger.info(`Arquivo ${day}: nenhum trade fechado neste dia`);
     return null;
   }
 
@@ -257,6 +298,54 @@ async function archiveClosedTrades(dateStr) {
   return { day, count: limpos.length, pnl, winRate, wins, porOrigem };
 }
 
+// ── Catch-up de arquivos perdidos (chamado no arranque) ──────────────────────
+// Resolve o "dia perdido": se o bot esteve em baixo / reiniciou na meia-noite,
+// o cron desse dia não correu. No arranque, percorre do dia seguinte ao último
+// arquivo até ontem e arquiva cada dia em falta. Idempotente.
+async function catchUpArchives() {
+  try {
+    const ontem = lisbonYesterdayString();
+    const last  = await getLastArchivedDay();
+
+    let cursor;
+    if (last) {
+      const d = new Date(`${last}T12:00:00Z`); // meio-dia evita saltos de DST
+      d.setUTCDate(d.getUTCDate() + 1);
+      cursor = lisbonDayString(d);
+    } else {
+      cursor = ontem; // sem histórico: só tenta recuperar ontem
+    }
+
+    if (cursor > ontem) {
+      logger.info("Catch-up de arquivo: nada em falta ✓");
+      return [];
+    }
+
+    const recuperados = [];
+    let guard = 0;
+    while (cursor <= ontem && guard < 60) {
+      guard++;
+      const r = await archiveClosedTrades(cursor);
+      if (r) recuperados.push(r);
+      const d = new Date(`${cursor}T12:00:00Z`);
+      d.setUTCDate(d.getUTCDate() + 1);
+      cursor = lisbonDayString(d);
+    }
+
+    if (recuperados.length) {
+      const dias = recuperados.map(r => `${r.day} (${r.count})`).join(", ");
+      logger.info(`📁 Catch-up: recuperados ${recuperados.length} dia(s) — ${dias}`);
+    } else {
+      logger.info("Catch-up de arquivo: nada para recuperar ✓");
+    }
+    return recuperados;
+  } catch (err) {
+    logger.error(`Catch-up de arquivo falhou: ${err.message}`);
+    await logError("catch-up-archive", err).catch(() => {});
+    return [];
+  }
+}
+
 module.exports = {
   initFirebase,
   watchStrategies,
@@ -273,5 +362,8 @@ module.exports = {
   getSetting,
   watchSetting,
   archiveClosedTrades,
+  getLastArchivedDay,
+  catchUpArchives,
+  lisbonDayString,
   USER_UID,
 };

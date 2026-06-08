@@ -107,13 +107,13 @@ async function main() {
     cron.schedule("0 21 * * *", async () => {
       const m = await stats.dailyReport(false);
       logger.info(`📊 Stats guardadas: ${m.totalTrades} trades | WR ${m.winRate?.toFixed(1)}% | P&L €${m.totalPnl?.toFixed(2)}`);
-    });
+    }, { timezone: "Europe/Lisbon" });
 
     // Heartbeat de hora em hora
     cron.schedule("0 * * * *", () => {
       const m = stats.getMetrics();
       logger.info(`♥ Heartbeat | Trades: ${m.totalTrades} | P&L: €${m.totalPnl?.toFixed(2)}`);
-    });
+    }, { timezone: "Europe/Lisbon" });
 
     // Arquivo automático à meia-noite — move os trades fechados do dia anterior
     // para users/{uid}/archives/{dia} e limpa a lista ativa. (fuso de Portugal)
@@ -129,6 +129,26 @@ async function main() {
         await fb.logError("daily-archive", err).catch(() => {});
       }
     }, { timezone: "Europe/Lisbon" });
+
+    // ── CATCH-UP DE ARQUIVO NO ARRANQUE ─────────────────────────────────────
+    // Se o bot esteve em baixo / reiniciou à meia-noite, o cron desse dia não
+    // correu. Aqui recuperamos qualquer dia em falta entre o último arquivo e
+    // ontem. É idempotente: dias já arquivados são ignorados.
+    try {
+      const recuperados = await fb.catchUpArchives();
+      if (recuperados && recuperados.length) {
+        for (const r of recuperados) {
+          await notify(tg.dailySummary(r)).catch(() => {});
+        }
+        await notify(
+          `📁 *Catch-up de arquivo*\n` +
+          `Recuperados ${recuperados.length} dia(s) que tinham ficado por arquivar:\n` +
+          recuperados.map(r => `• ${r.day} — ${r.count} trades`).join("\n")
+        ).catch(() => {});
+      }
+    } catch (err) {
+      logger.error(`Catch-up no arranque falhou: ${err.message}`);
+    }
 
     // ── GRACEFUL SHUTDOWN ──────────────────────────────────────────────────
     const shutdown = async (sig) => {
