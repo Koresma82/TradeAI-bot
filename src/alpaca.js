@@ -59,17 +59,23 @@ async function getPositions() {
 
 // ── Colocar ordem de mercado ──────────────────────────────────────────────────
 async function placeOrder({ symbol, qty, side, takeProfit, stopLoss }) {
-  // Alpaca suporta bracket orders nativamente
+  // A Alpaca trata cripto e ações de forma diferente:
+  //  • Cripto (símbolo com "/", ex.: SOL/USD) → time_in_force DEVE ser "gtc"
+  //    e NÃO aceita bracket (SL/TP nativo). Enviar "day" dá erro 422
+  //    "invalid crypto time_in_force"; enviar bracket também é rejeitado.
+  //  • Ações/ETF (ex.: SPY) → "day" e bracket nativo são suportados.
+  const isCrypto = String(symbol).includes("/");
+
   const body = {
     symbol,
     qty:        qty.toFixed(8),
     side,       // "buy" | "sell"
     type:       "market",
-    time_in_force: "day",
+    time_in_force: isCrypto ? "gtc" : "day",
   };
 
-  // Adicionar bracket se tiver SL/TP
-  if (takeProfit || stopLoss) {
+  // Bracket (SL/TP nativo) só em ações/ETF — nunca em cripto.
+  if (!isCrypto && (takeProfit || stopLoss)) {
     body.order_class = "bracket";
     if (takeProfit) body.take_profit = { limit_price: takeProfit.toFixed(2) };
     if (stopLoss)   body.stop_loss   = { stop_price:  stopLoss.toFixed(2)   };
