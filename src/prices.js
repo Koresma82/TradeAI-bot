@@ -279,7 +279,7 @@ async function fetchStooq() {
 async function refreshAll() {
   if (!initialized) {
     Object.entries(BASE_PRICES).forEach(([id, p]) => {
-      if (!priceCache[id]) priceCache[id] = { price: p, change: 0, ts: Date.now() };
+      if (!priceCache[id]) priceCache[id] = { price: p, change: 0, ts: Date.now(), seed: true };
     });
     initialized = true;
   }
@@ -317,6 +317,21 @@ async function refreshAll() {
 
 function getPrice(assetId) { return priceCache[assetId]?.price || BASE_PRICES[assetId] || null; }
 function getAll()          { return { ...priceCache }; }
+
+// ── Preço FRESCO e REAL (para decisões de trading) ───────────────────────────
+// getPrice() devolve o base estático como último recurso, o que é aceitável para
+// DISPLAY mas perigoso para SL/TP/abertura/fecho: comparar uma entrada real com
+// um base desatualizado gera P&L e disparos fantasma (foi o que aconteceu com o
+// ouro na app). Para trading, usamos getFreshPrice(): só devolve preço se vier
+// mesmo de um feed (não-seed) e estiver fresco; caso contrário devolve null e o
+// motor NÃO opera nesse ativo neste tick.
+function isReal(assetId, maxAgeMs = 120000) {
+  const c = priceCache[assetId];
+  return !!c && !c.seed && typeof c.price === "number" && c.price > 0 && (Date.now() - c.ts) <= maxAgeMs;
+}
+function getFreshPrice(assetId, maxAgeMs = 120000) {
+  return isReal(assetId, maxAgeMs) ? priceCache[assetId].price : null;
+}
 
 // ── Histórico diário (para indicadores: RSI, médias móveis) ──────────────────
 // Busca ~3 meses de fechos diários. Stooq (ações/ETF/commodity/forex) e
@@ -357,4 +372,4 @@ async function fetchHistory() {
   return hist;
 }
 
-module.exports = { refreshAll, getPrice, getAll, getSourceHealth, fetchHistory, ASSETS, BASE_PRICES };
+module.exports = { refreshAll, getPrice, getFreshPrice, isReal, getAll, getSourceHealth, fetchHistory, ASSETS, BASE_PRICES };

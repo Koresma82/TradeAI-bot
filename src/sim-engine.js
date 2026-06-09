@@ -101,14 +101,17 @@ async function checkSLTP(currentPrices) {
   const flipConf   = appSettings.aiBrainConfianca || 78;
 
   for (const [posId, pos] of Object.entries(openPositions)) {
-    const price = currentPrices[pos.assetId]?.price;
+    // Só geримос com preço REAL e fresco. Um preço "seed" (base estático) ou
+    // stale não pode disparar SL/TP/AI-EXIT — senão comparávamos a entrada real
+    // com um preço fantasma e fechávamos a posição ao valor errado.
+    const price = prices.isReal(pos.assetId) ? currentPrices[pos.assetId]?.price : null;
     if (!price) {
-      // Posição aberta sem preço atual (fonte falhou ou ativo removido).
-      // Não a perdemos — fica aberta e gerida assim que o preço voltar.
-      // Avisa 1x por hora para não encher os logs.
+      // Posição aberta sem preço REAL atual (fonte falhou, preço só em base, ou
+      // ativo removido). Não a perdemos — fica aberta e gerida assim que voltar
+      // um preço fresco de feed. Avisa 1x por hora para não encher os logs.
       const k = `nopx_${pos.assetId}`;
       if (!noPriceWarned[k] || Date.now() - noPriceWarned[k] > 3600000) {
-        logger.warn(`⚠ Sem preço para ${pos.assetSym || pos.assetId} (posição aberta continua segura, à espera de preço)`);
+        logger.warn(`⚠ Sem preço real fresco para ${pos.assetSym || pos.assetId} (posição aberta continua segura, à espera de preço de feed)`);
         noPriceWarned[k] = Date.now();
       }
       continue;
@@ -128,6 +131,12 @@ async function checkSLTP(currentPrices) {
       }
     }
 
+    // Fix 5: se a corretora gere SL/TP desta posição (bracket nativo em ações),
+    // o motor NÃO mexe — quem fecha é a corretora. Evita o duplo-fecho (bot +
+    // bracket) que resultaria numa venda a descoberto. A reconciliação no
+    // arranque/periódica deteta quando o bracket fechou a posição.
+    if (pos.brokerSLTP) continue;
+
     let reason = null;
     let closePrice = price;
 
@@ -144,10 +153,16 @@ async function checkSLTP(currentPrices) {
     const podeAiExit = idadeMs >= 120000; // 2 min
 
     // ── Saída antecipada se a IA virar para VENDER com confiança ──
-    // Só fecha SE houver lucro (a função é "proteger ganhos", não sair a zero/perda).
+    // Só fecha SE o lucro LÍQUIDO (após comissões ida-e-volta) for positivo com
+    // uma margem mínima. Antes, fechávamos em qualquer micro-lucro (+€0.01), que
+    // em cripto (0.25%/lado) seria PERDA depois das comissões. Agora o AI-EXIT
+    // só dispara se valer mesmo a pena.
     const sg = aiSignals.getSignal(pos.assetId);
-    const emLucro = price > pos.entryPrice;
-    if (!onHold && podeAiExit && exitOnFlip && sg && sg.sinal === "VENDER" && (sg.confianca || 0) >= flipConf && emLucro && price > pos.sl) {
+    const rtFee = broker.roundTripFee(pos.assetId, pos.amount); // comissão compra+venda (€)
+    const minLucro = rtFee + (pos.amount * 0.0010); // comissões + 0.10% de margem
+    const lucroLiquidoSeFechar = (price - pos.entryPrice) * pos.units - rtFee;
+    const valeAPena = lucroLiquidoSeFechar >= (pos.amount * 0.0010); // lucro líq. acima da margem
+    if (!onHold && podeAiExit && exitOnFlip && sg && sg.sinal === "VENDER" && (sg.confianca || 0) >= flipConf && valeAPena && price > pos.sl) {
       reason = "AI-EXIT"; closePrice = price;
     }
     else if (price <= pos.sl) {
@@ -169,9 +184,6 @@ async function checkSLTP(currentPrices) {
 
     if (!reason) continue;
 
-    const pnl = (closePrice - pos.entryPrice) * pos.units;
-    const icon = pnl >= 0 ? "✅" : "🛑";
-
     // ── Executar a venda real na Alpaca se em modo live ──
     if (broker.isLive()) {
       const exec = await broker.sell({ assetId: pos.assetId, units: pos.units, price: closePrice, broker: pos.broker });
@@ -179,9 +191,18 @@ async function checkSLTP(currentPrices) {
         logger.warn(`Venda ${pos.assetSym} falhou: ${exec.reason} — tenta no próximo tick`);
         continue; // não fecha localmente se a corretora recusou
       }
+      // Fix 1: usar o preço REAL de execução para o P&L (não o teórico).
+      if (typeof exec.fillPrice === "number" && exec.fillPrice > 0) closePrice = exec.fillPrice;
     }
 
-    logger.info(`${icon} ${reason} ${pos.assetSym} | P&L ${sign(pnl)}${eur(pnl)}`);
+    // P&L LÍQUIDO: lucro bruto menos comissões ida-e-volta. Em sim isto torna o
+    // resultado realista (igual ao paper/real); em ações/ETF a comissão é 0.
+    const pnlBruto = (closePrice - pos.entryPrice) * pos.units;
+    const fee = broker.roundTripFee(pos.assetId, pos.amount);
+    const pnl = +(pnlBruto - fee).toFixed(4);
+    const icon = pnl >= 0 ? "✅" : "🛑";
+
+    logger.info(`${icon} ${reason} ${pos.assetSym} | P&L ${sign(pnl)}${eur(pnl)}${fee > 0 ? ` (após €${fee.toFixed(2)} comissão)` : ""}`);
 
     const closedTs = Date.now();
     const closedTrade = {
@@ -190,16 +211,18 @@ async function checkSLTP(currentPrices) {
       closePrice,
       closedAt:  new Date().toLocaleString("pt-PT"),
       closedTs,
+      fee,
+      pnlBruto: +pnlBruto.toFixed(4),
       pnl,
     };
 
-    // Remove posição + devolve saldo
+    // Remove posição + devolve saldo (líquido de comissões)
     delete openPositions[posId];
     totalInvested = Math.max(0, totalInvested - pos.amount);
     simBalance    = +(simBalance + pos.amount + pnl).toFixed(2);
 
     // Guarda no Firestore
-    await fb.updateTrade("server", posId, { status: reason, closePrice, pnl, closedAt: closedTrade.closedAt, closedTs });
+    await fb.updateTrade("server", posId, { status: reason, closePrice, pnl, fee, pnlBruto: closedTrade.pnlBruto, closedAt: closedTrade.closedAt, closedTs });
     await fb.saveBalance("server", simBalance);
     stats.addClosedTrade(closedTrade);
     dailyLossHit = stats.checkDailyLossLimit();
@@ -239,6 +262,13 @@ function suggestAmount(assetId, confianca, strategy) {
 
 // ── Executar compra simulada ──────────────────────────────────────────────────
 async function executeBuy(strategy, assetId, price, confianca) {
+  // Travão de segurança: nunca abrir a um preço fantasma (base estático/stale).
+  // Se o preço passado não é real e fresco, não abre — protege contra entradas
+  // a valores irreais quando as fontes de preço falham.
+  if (!prices.isReal(assetId)) {
+    logger.warn(`Compra ${assetId} ignorada: sem preço real fresco (a evitar entrada a preço fantasma)`);
+    return;
+  }
   // Quantia: por perfil+confiança+saldo se modoInvestimento="auto", senão fixo.
   const sized  = suggestAmount(assetId, confianca, strategy);
   const amount = Math.min(sized, parseFloat(process.env.MAX_POSITION_EUR || "500"));
@@ -263,28 +293,31 @@ async function executeBuy(strategy, assetId, price, confianca) {
       // Limite cheio, rotação desligada → não compra
       return;
     }
-    // ── ROTAÇÃO: vender a posição com mais lucro para abrir esta ──
-    let bestWinner = null, bestPnl = -Infinity;
+    // ── ROTAÇÃO: vender a posição com mais lucro LÍQUIDO para abrir esta ──
+    let bestWinner = null, bestNet = -Infinity, bestCur = 0, bestFee = 0;
     for (const pos of stratPositions) {
-      const cur = prices.getPrice(pos.assetId);
-      if (!cur) continue;
-      const pnl = (cur - pos.entryPrice) * pos.units;
-      if (pnl > bestPnl) { bestPnl = pnl; bestWinner = pos; }
+      const cur = prices.getFreshPrice(pos.assetId);
+      if (!cur) continue; // sem preço real fresco → não avalia esta posição
+      const fee = broker.roundTripFee(pos.assetId, pos.amount);
+      const net = (cur - pos.entryPrice) * pos.units - fee;
+      if (net > bestNet) { bestNet = net; bestWinner = pos; bestCur = cur; bestFee = fee; }
     }
-    // Só roda se a melhor posição estiver em lucro
-    if (!bestWinner || bestPnl <= 0) {
-      return; // nenhuma em lucro para sacrificar
+    // Só roda se a melhor posição der lucro LÍQUIDO (depois de comissões).
+    if (!bestWinner || bestNet <= 0) {
+      return; // nenhuma com lucro líquido para sacrificar
     }
-    // Fechar o vencedor
-    const cur = prices.getPrice(bestWinner.assetId);
+    // Fechar o vencedor (P&L líquido de comissões)
+    const cur = bestCur;
+    const bestPnl = +bestNet.toFixed(4);
+    const bestBruto = +((bestCur - bestWinner.entryPrice) * bestWinner.units).toFixed(4);
     delete openPositions[bestWinner.id];
     totalInvested = Math.max(0, totalInvested - bestWinner.amount);
     simBalance = +(simBalance + bestWinner.amount + bestPnl).toFixed(2);
     const rotClosedTs = Date.now();
-    await fb.updateTrade("server", bestWinner.id, { status: "ROTACAO", closePrice: cur, pnl: bestPnl, closedAt: new Date().toLocaleString("pt-PT"), closedTs: rotClosedTs });
+    await fb.updateTrade("server", bestWinner.id, { status: "ROTACAO", closePrice: cur, pnl: bestPnl, fee: bestFee, pnlBruto: bestBruto, closedAt: new Date().toLocaleString("pt-PT"), closedTs: rotClosedTs });
     await fb.saveBalance("server", simBalance);
-    stats.addClosedTrade({ ...bestWinner, status: "ROTACAO", closePrice: cur, pnl: bestPnl, closedTs: rotClosedTs });
-    logger.info(`🔄 ROTAÇÃO: fechado ${bestWinner.assetSym} (+€${bestPnl.toFixed(2)}) para abrir ${assetId}`);
+    stats.addClosedTrade({ ...bestWinner, status: "ROTACAO", closePrice: cur, pnl: bestPnl, fee: bestFee, pnlBruto: bestBruto, closedTs: rotClosedTs });
+    logger.info(`🔄 ROTAÇÃO: fechado ${bestWinner.assetSym} (líq. +€${bestPnl.toFixed(2)}${bestFee>0?`, após €${bestFee.toFixed(2)} comissão`:""}) para abrir ${assetId}`);
   }
 
   const units = +(amount / price).toFixed(7);
@@ -292,14 +325,37 @@ async function executeBuy(strategy, assetId, price, confianca) {
   const tp    = +(price * (1 + strategy.tp  / 100)).toFixed(4);
   const posId = `${broker.isLive() ? "live" : "sim"}_${Date.now()}_${assetId}`;
 
+  // Fix 3 (atomicidade): em LIVE, gravamos primeiro um registo PENDING no
+  // Firestore ANTES de chamar a corretora. Se o bot crashar entre a ordem e a
+  // gravação final, fica um rasto recuperável (PENDING) em vez de uma posição
+  // real invisível. Em sim não é preciso (não há ordem externa a perder).
+  if (broker.isLive()) {
+    await fb.saveTrade("server", {
+      id: posId, assetId, assetName: assetId, assetSym: assetId.toUpperCase(),
+      entryPrice: price, units, amount, sl, tp,
+      strategy: strategy.nome, stratId: strategy.id,
+      openedAt: new Date().toLocaleString("pt-PT"), openedTs: Date.now(),
+      status: "PENDING", mode: "live",
+    }).catch(e => logger.warn(`Pré-registo PENDING falhou: ${e.message}`));
+  }
+
   // ── Executar a ordem (real na Alpaca se MODE=paper/real; senão simulada) ──
   const exec = await broker.buy({ assetId, amount, price, sl, tp });
   if (!exec.ok) {
     logger.warn(`Compra ${assetId} não executada: ${exec.reason}`);
+    // Limpar o registo PENDING que criámos (a ordem não foi aceite).
+    if (broker.isLive()) await fb.updateTrade("server", posId, { status: "CANCELADA", closedTs: Date.now() }).catch(() => {});
     return;
   }
+  // Fix 1/6: preço e unidades REAIS de execução. Se a corretora confirmou uma
+  // quantidade preenchida, usamo-la; senão derivamos do fill price.
   const fillPrice = exec.fillPrice || price;
-  const realUnits = +(amount / fillPrice).toFixed(7);
+  const brokerFilled = (typeof exec.filledQty === "number" ? exec.filledQty
+                      : typeof exec.filledUnits === "number" ? exec.filledUnits
+                      : null);
+  const realUnits = (typeof brokerFilled === "number" && brokerFilled > 0)
+    ? brokerFilled
+    : +(amount / fillPrice).toFixed(7);
 
   const position = {
     id:          posId,
@@ -318,6 +374,11 @@ async function executeBuy(strategy, assetId, price, confianca) {
     mode:        broker.isLive() ? "live" : "sim",
     brokerOrderId: exec.brokerOrderId || null,
     broker:      exec.broker || null,
+    brokerSymbol: exec.brokerSymbol || null,
+    // Fix 5: se a corretora gere SL/TP nativamente (bracket em ações), o nosso
+    // motor NÃO deve também fechar — senão disparam os dois (venda a descoberto).
+    brokerSLTP:  !!exec.bracket,
+    pendingFill: !!exec.pending, // fill provisório; reconciliação confirma depois
   };
 
   openPositions[posId] = position;
@@ -329,7 +390,7 @@ async function executeBuy(strategy, assetId, price, confianca) {
   await fb.saveBalance("server", simBalance);
   await notify(tg.tradeOpen(position, broker.getMode()));
 
-  logger.info(`BUY ${broker.getMode().toUpperCase()} ${assetId} | €${amount} | @$${fillPrice} | SL $${sl} | TP $${tp}`);
+  logger.info(`BUY ${broker.getMode().toUpperCase()} ${assetId} | €${amount} | @$${fillPrice} | SL $${sl} | TP $${tp}${position.brokerSLTP ? " (SL/TP na corretora)" : ""}`);
 }
 
 // ── Hooks usados pelo módulo de day trading ──────────────────────────────────
@@ -383,6 +444,9 @@ async function runAiBrain(currentPrices) {
     if (!isMarketOpenFor(sg.id)) continue;
     const pd = currentPrices[sg.id];
     if (!pd?.price) continue;
+    // Nunca abrir uma posição a um preço fantasma (base/stale): sem preço real
+    // fresco, salta este ativo neste tick.
+    if (!prices.isReal(sg.id)) continue;
 
     // ── Travão de sanidade: o Groq pode inflacionar confiança (diz 100% em
     //    ativos parados). Só entra se os INDICADORES TÉCNICOS também concordarem.
@@ -692,6 +756,57 @@ async function init() {
     }
   } catch (e) {
     logger.error(`Falha a recuperar posições abertas: ${e.message}`);
+  }
+
+  // ── Fix 4: RECONCILIAÇÃO com a corretora (só em live) ───────────────────────
+  // Compara o que o bot julga ter (Firestore) com o que a corretora REALMENTE
+  // tem. Apanha divergências criadas por crashes a meio de uma ordem, brackets
+  // que fecharam sozinhos, ou posições abertas fora do bot.
+  if (broker.isLive()) {
+    try {
+      const reais = await broker.getPositions(); // [{ broker, symbol, qty, avgPrice }]
+      if (reais) {
+        const norm = s => String(s || "").toUpperCase().replace("/", "");
+        const realBySym = new Map();
+        reais.forEach(p => realBySym.set(norm(p.symbol), p));
+
+        const avisos = [];
+        // (a) Posições que o bot acha abertas mas a corretora já NÃO tem →
+        //     foram fechadas fora do bot (ex.: bracket disparou). Marcar fechadas.
+        for (const [id, pos] of Object.entries(openPositions)) {
+          if (pos.mode !== "live") continue;
+          const sym = norm(pos.brokerSymbol || pos.assetSym || pos.assetId);
+          if (!realBySym.has(sym)) {
+            avisos.push(`• ${pos.assetSym}: o bot tinha-a aberta mas a corretora já não a tem → marcada FECHADA-RECON`);
+            await fb.updateTrade("server", id, { status: "FECHADA-RECON", closedAt: new Date().toLocaleString("pt-PT"), closedTs: Date.now() }).catch(() => {});
+            delete openPositions[id];
+          }
+        }
+        // (b) Posições reais na corretora que o bot NÃO conhece → órfãs do lado
+        //     da corretora (ex.: crash entre ordem e gravação). Só avisamos —
+        //     não inventamos uma posição com entrada/SL/TP que não sabemos.
+        const conhecidas = new Set(Object.values(openPositions)
+          .filter(p => p.mode === "live")
+          .map(p => norm(p.brokerSymbol || p.assetSym || p.assetId)));
+        for (const [sym, rp] of realBySym.entries()) {
+          if (!conhecidas.has(sym)) {
+            avisos.push(`• ${rp.symbol} (${rp.qty} @ $${rp.avgPrice}): existe na corretora mas o bot não a conhece → REQUER ATENÇÃO MANUAL (sem SL/TP gerido)`);
+          }
+        }
+
+        if (avisos.length) {
+          const msg = `⚠ *Reconciliação com a corretora* encontrou divergências:\n${avisos.join("\n")}`;
+          logger.warn(msg.replace(/\*/g, ""));
+          await notify(msg).catch(() => {});
+        } else {
+          logger.info("✓ Reconciliação com a corretora: tudo alinhado");
+        }
+      } else {
+        logger.warn("Reconciliação: a corretora não devolveu posições (a saltar)");
+      }
+    } catch (e) {
+      logger.error(`Reconciliação com a corretora falhou: ${e.message}`);
+    }
   }
 
   // Vigiar trades abertos em tempo real — apanha compras MANUAIS feitas na app

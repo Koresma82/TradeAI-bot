@@ -90,6 +90,34 @@ async function closePosition(symbol) {
   return order;
 }
 
+// ── Fechar uma QUANTIDADE específica de uma posição ──────────────────────────
+// Fecha exatamente `qty` unidades (não a posição inteira do símbolo), devolvendo
+// a ordem para podermos ler o preço real de execução. Se qty for nula/indefinida
+// ou >= à posição, fecha tudo (comportamento antigo). Tenta confirmar o fill.
+async function closePositionQty(symbol, qty) {
+  let order;
+  if (qty == null || !(qty > 0)) {
+    order = await alpacaFetch(`/v2/positions/${symbol}`, { method: "DELETE" });
+  } else {
+    // qty como query param fecha só essa porção da posição
+    order = await alpacaFetch(`/v2/positions/${symbol}?qty=${qty}`, { method: "DELETE" });
+  }
+  logger.info(`Alpaca fechar ${qty != null ? qty : "TUDO"} de ${symbol} | id: ${order?.id || "?"}`);
+  // Tentar confirmar o fill (a DELETE devolve a ordem mas pode ainda não ter preço)
+  if (order?.id && !order.filled_avg_price) {
+    try {
+      const confirmed = await getOrder(order.id);
+      if (confirmed?.filled_avg_price) return confirmed;
+    } catch { /* fica com a ordem inicial */ }
+  }
+  return order;
+}
+
+// ── Consultar uma ordem (para confirmar fill) ────────────────────────────────
+async function getOrder(orderId) {
+  return alpacaFetch(`/v2/orders/${orderId}`);
+}
+
 // ── Cancelar ordem ────────────────────────────────────────────────────────────
 async function cancelOrder(orderId) {
   await alpacaFetch(`/v2/orders/${orderId}`, { method: "DELETE" });
@@ -132,6 +160,8 @@ module.exports = {
   getPositions,
   placeOrder,
   closePosition,
+  closePositionQty,
+  getOrder,
   cancelOrder,
   isMarketOpen,
   isLive,

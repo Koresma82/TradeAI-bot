@@ -125,8 +125,8 @@ JSON: {"oportunidades":[{"id":"silver","acao":"COMPRAR|VENDER|AGUARDAR","entrada
     if (!isOpen(id)) continue;
     if (engine.countDayTrades() >= maxDayTrading) break;   // limite de posições
     if (engine.hasOpen(id, "daytrading")) continue;        // não duplica o mesmo ativo
-    const price = prices.getPrice(id);
-    if (!price) continue;
+    const price = prices.getFreshPrice(id);
+    if (!price) continue; // sem preço real fresco → não abre day-trade neste ativo
 
     const m = META[id] || { nome: id, sym: id.toUpperCase() };
     const ok = await engine.openDayTrade({

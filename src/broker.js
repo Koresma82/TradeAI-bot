@@ -40,6 +40,32 @@ function assetClass(assetId) {
   return "stock";
 }
 
+// ── Comissões por classe de ativo (fração do valor da ordem, por LADO) ───────
+// Alpaca: ações/ETF = $0; cripto = 0.25% por lado (taker, nível normal).
+// Commodities/ações via ETF (GLD, USO…) → tratadas como ETF (comissão 0).
+// Forex não é negociado pela Alpaca/Binance aqui — fica a 0 por agora.
+// Configurável por env (CRYPTO_FEE_BPS em pontos-base) para afinar sem código.
+const CRYPTO_FEE = (parseFloat(process.env.CRYPTO_FEE_BPS || "25")) / 10000; // 25 bps = 0.25%
+const FEE_BY_CLASS = {
+  crypto:    CRYPTO_FEE,
+  etf:       0,
+  stock:     0,
+  commodity: 0, // negociadas via ETF (GLD/USO/…) → comissão 0 na Alpaca
+  forex:     0,
+};
+
+// Comissão estimada (€) para UM lado (compra OU venda) de uma ordem de `amount` €.
+function feeRate(assetId) {
+  return FEE_BY_CLASS[assetClass(assetId)] ?? 0;
+}
+function estimateFee(assetId, amount) {
+  return +(Math.abs(amount || 0) * feeRate(assetId)).toFixed(4);
+}
+// Comissão ida-e-volta (compra + venda) — útil para o "lucro mínimo".
+function roundTripFee(assetId, amount) {
+  return +(estimateFee(assetId, amount) * 2).toFixed(4);
+}
+
 // Preferência por classe (ordem = prioridade). Failover segue esta ordem.
 const DEFAULT_ROUTING = {
   crypto:    ["alpaca", "binance"], // crypto: Alpaca primeiro (tem paper); Binance se quiseres real
@@ -118,26 +144,50 @@ async function verifyConnection() {
   return { ok: true, mode: MODE, brokers: avail.map(a => a.id) };
 }
 
-// Saldo: soma o saldo dos brokers disponíveis (em sim devolve null).
+// Saldo: em sim devolve null. Com UM broker, devolve o cash desse broker.
+// Fix 7: com VÁRIOS brokers, NÃO soma (somar dá uma falsa sensação de capital
+// disponível e leva a sobre-alavancagem). Devolve o MENOR cash disponível como
+// referência conservadora e regista o detalhe.
 async function getBalance() {
   if (!LIVE) return null;
-  let total = 0, any = false;
-  for (const a of registry.available()) {
-    try { const b = await a.getBalance(); if (b != null) { total += b; any = true; } }
+  const avail = registry.available();
+  const saldos = [];
+  for (const a of avail) {
+    try { const b = await a.getBalance(); if (b != null) saldos.push({ id: a.id, bal: b }); }
     catch (e) { logger.warn(`getBalance ${a.id} falhou: ${e.message}`); }
   }
-  return any ? total : null;
+  if (!saldos.length) return null;
+  if (saldos.length === 1) return saldos[0].bal;
+  const min = Math.min(...saldos.map(s => s.bal));
+  logger.warn(`getBalance: ${saldos.length} brokers (${saldos.map(s => `${s.id}:$${s.bal.toFixed(0)}`).join(", ")}) — a usar o menor ($${min.toFixed(0)}) como referência conservadora (NÃO somado).`);
+  return min;
+}
+
+// Posições reais agregadas de todos os brokers (para reconciliação no arranque).
+// Devolve [{ broker, symbol, qty, avgPrice }] ou null se nenhum broker souber.
+async function getPositions() {
+  if (!LIVE) return null;
+  const out = [];
+  let any = false;
+  for (const a of registry.available()) {
+    if (typeof a.getPositions !== "function") continue;
+    try {
+      const ps = await a.getPositions();
+      if (ps) { any = true; ps.forEach(p => out.push({ broker: a.id, ...p })); }
+    } catch (e) { logger.warn(`getPositions ${a.id} falhou: ${e.message}`); }
+  }
+  return any ? out : null;
 }
 
 // ── COMPRA ───────────────────────────────────────────────────────────────────
 async function buy({ assetId, amount, price, sl, tp }) {
   if (!LIVE) {
-    return { ok: true, fillPrice: price, brokerOrderId: null, simulated: true };
+    return { ok: true, fillPrice: price, brokerOrderId: null, simulated: true, bracket: false, pending: false };
   }
   const a = pickAdapter(assetId);
   if (!a) return { ok: false, reason: `sem broker para ${assetId}` };
   const res = await a.buy({ assetId, amount, price, sl, tp });
-  if (res.ok) logger.info(`↗ ${a.id} BUY ${assetId} | €${amount} @ $${res.fillPrice}`);
+  if (res.ok) logger.info(`↗ ${a.id} BUY ${assetId} | €${amount} @ $${res.fillPrice}${res.pending ? " (fill pendente)" : ""}`);
   return { ...res, broker: a.id };
 }
 
@@ -167,7 +217,8 @@ function explainRouting(assetIds = []) {
 function isCrypto(assetId) { return CRYPTO_IDS.has(assetId); }
 
 module.exports = {
-  getMode, isLive, isReal, verifyConnection, getBalance,
+  getMode, isLive, isReal, verifyConnection, getBalance, getPositions,
   buy, sell, isCrypto, assetClass, pickAdapter, explainRouting,
+  estimateFee, roundTripFee, feeRate,
   registry,
 };
