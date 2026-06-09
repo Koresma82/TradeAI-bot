@@ -6,7 +6,7 @@ const logger = require("../logger");
 const alpaca = require("../alpaca");
 
 // IDs de crypto que a Alpaca negoceia (formato de ordem "BTC/USD").
-const CRYPTO_IDS = new Set(["btc", "eth", "bnb", "sol", "xrp", "doge"]);
+const CRYPTO_IDS = new Set(["btc", "eth", "bnb", "sol", "xrp", "doge", "ada", "avax", "dot", "link"]);
 // Ativos não-crypto que a Alpaca cobre via ETF/ticker (ver SYMBOL_MAP em alpaca.js).
 const NON_CRYPTO_SUPPORTED = new Set([
   "spy", "qqq", "iwm", "gld", "tlt", "xle", "eem", "vti",

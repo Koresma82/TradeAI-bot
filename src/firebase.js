@@ -100,7 +100,26 @@ async function updateTrade(uid, id, updates) {
   }, { merge: true });
 }
 
-// ── Guardar setting (P&L ao vivo, saldo, etc.) ───────────────────────────────
+// ── Fila de comandos (app → bot) ─────────────────────────────────────────────
+// A app escreve a intenção do utilizador (comprar/vender manualmente) na coleção
+// "commands"; o bot lê os pendentes, executa na corretora e marca como feitos.
+// Isto mantém o bot como ÚNICA autoridade de execução — a app nunca negoceia.
+async function fetchPendingCommands() {
+  const snap = await userCol("commands").where("status", "==", "PENDENTE").get();
+  return snap.docs
+    .map(d => ({ id: d.id, ref: d.ref, ...d.data() }))
+    .sort((a, b) => (a.createdTs || 0) - (b.createdTs || 0)); // mais antigo primeiro
+}
+async function markCommand(id, status, result) {
+  await userDoc("commands", id).set({
+    status,
+    result: result || null,
+    processedTs: Date.now(),
+    processedAt: admin.firestore.FieldValue.serverTimestamp(),
+  }, { merge: true });
+}
+
+// ── Actualizar setting (P&L ao vivo, saldo, etc.) ────────────────────────────
 async function saveSetting(uid, key, value) {
   await userDoc("settings", key).set({
     value,
@@ -364,6 +383,8 @@ module.exports = {
   archiveClosedTrades,
   getLastArchivedDay,
   catchUpArchives,
+  fetchPendingCommands,
+  markCommand,
   lisbonDayString,
   USER_UID,
 };

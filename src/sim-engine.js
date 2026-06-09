@@ -557,6 +557,9 @@ async function tick() {
     // 2. Verificar SL/TP
     await checkSLTP(currentPrices);
 
+    // 2b. Processar comandos manuais da app (compra/venda pedida pelo utilizador)
+    await processCommands(currentPrices);
+
     // 3. Verificar sinais das estratégias
     if (!dailyLossHit) {
       for (const strategy of strategies) {
@@ -567,10 +570,13 @@ async function tick() {
           // Não comprar em mercado fechado (preços congelados → sinais falsos)
           if (!isMarketOpenFor(assetId)) continue;
 
-          // Cooldown: não comprar o mesmo ativo/estratégia mais que 1x por 2 min
+          // Cooldown de re-entrada: não voltar ao mesmo ativo/estratégia durante
+          // X min. Evita o vai-e-vem de trades de <1min que não chegam a valorizar
+          // e o martelar de um ativo que a corretora rejeita. Configurável por env.
           const cdKey = `${strategy.id}_${assetId}`;
+          const cooldownMs = (parseInt(process.env.REENTRY_COOLDOWN_MIN || "10", 10)) * 60000;
           const lastBuy = lastBuyTime[cdKey] || 0;
-          if (Date.now() - lastBuy < 120000) continue;
+          if (Date.now() - lastBuy < cooldownMs) continue;
 
           // ── Sinal realista: combina histórico diário (RSI + média móvel)
           //    com a queda intradiária recente. Precisa de ≥2 critérios. ──
@@ -595,13 +601,14 @@ async function tick() {
 
           if (sinal.buy) {
             logger.info(`🎯 Sinal: ${strategy.nome} → ${assetId} | ${sinal.reason} (força ${sinal.score})`);
-            const before = Object.keys(openPositions).length;
-            // Confiança para o sizing: usa o score do sinal técnico, reforçado pela
-            // confiança da IA para o ativo se existir e for maior.
+            // Marca o cooldown ANTES de tentar — assim, mesmo que a ordem seja
+            // rejeitada pela corretora ou feche logo, não voltamos a martelar o
+            // mesmo ativo no ciclo seguinte (era a causa das dezenas de trades
+            // ADA <1min). A trava vale para tentativa, não só para sucesso.
+            lastBuyTime[cdKey] = Date.now();
             const aiSig = aiSignals.getSignal(assetId);
             const conf  = Math.max(sinal.score || 0, aiSig?.confianca || 0);
             await executeBuy(strategy, assetId, priceData.price, conf);
-            if (Object.keys(openPositions).length > before) lastBuyTime[cdKey] = Date.now();
           }
         }
       }
@@ -759,13 +766,20 @@ async function init() {
     }
   }
 
-  // Carregar saldo guardado
-  const savedBal = await fb.getBalance("server");
-  if (savedBal && savedBal > 0) {
-    simBalance = savedBal;
-    simCapital = savedBal; // considera o atual como base se já havia
-    stats.setBalance(simBalance);
-    logger.info(`Saldo restaurado: €${simBalance}`);
+  // Carregar saldo guardado — APENAS em simulação. Em paper/real, o saldo de
+  // referência é o da corretora (já lido acima); o saldo do Firestore não pode
+  // sobrepor-se, senão o sizing por % usa um valor errado (era o "Saldo
+  // restaurado €92410" a tapar o cash real da Alpaca).
+  if (!broker.isLive()) {
+    const savedBal = await fb.getBalance("server");
+    if (savedBal && savedBal > 0) {
+      simBalance = savedBal;
+      simCapital = savedBal; // considera o atual como base se já havia
+      stats.setBalance(simBalance);
+      logger.info(`Saldo restaurado (sim): €${simBalance}`);
+    }
+  } else {
+    logger.info(`Saldo de referência (corretora): €${simBalance}`);
   }
 
   // Recuperar posições abertas do Firestore (sobrevive a restarts/deploys)
@@ -961,4 +975,67 @@ async function init() {
   };
 }
 
-module.exports = { init };
+// ── Fechar uma posição específica a pedido do utilizador (via comando) ────────
+async function closePositionManual(posId, currentPrices) {
+  const pos = openPositions[posId];
+  if (!pos) return { ok: false, reason: "posição não encontrada (já fechada?)" };
+  let closePrice = prices.isReal(pos.assetId) ? (currentPrices?.[pos.assetId]?.price || prices.getFreshPrice(pos.assetId)) : null;
+  if (!closePrice) return { ok: false, reason: "sem preço real fresco — tenta daqui a pouco" };
+
+  if (broker.isLive()) {
+    const exec = await broker.sell({ assetId: pos.assetId, units: pos.units, price: closePrice, broker: pos.broker });
+    if (!exec.ok) return { ok: false, reason: `corretora recusou: ${exec.reason}` };
+    if (typeof exec.fillPrice === "number" && exec.fillPrice > 0) closePrice = exec.fillPrice;
+  }
+  const pnlBruto = (closePrice - pos.entryPrice) * pos.units;
+  const fee = broker.roundTripFee(pos.assetId, pos.amount);
+  const pnl = +(pnlBruto - fee).toFixed(4);
+  const closedTs = Date.now();
+  const closedTrade = { ...pos, status: "MANUAL", closePrice, closedAt: new Date().toLocaleString("pt-PT"), closedTs, fee, pnlBruto: +pnlBruto.toFixed(4), pnl };
+  delete openPositions[posId];
+  totalInvested = Math.max(0, totalInvested - pos.amount);
+  simBalance = +(simBalance + pos.amount + pnl).toFixed(2);
+  await fb.updateTrade("server", posId, { status: "MANUAL", closePrice, pnl, fee, pnlBruto: closedTrade.pnlBruto, closedAt: closedTrade.closedAt, closedTs });
+  await fb.saveBalance("server", simBalance);
+  stats.addClosedTrade(closedTrade);
+  await notify(tg.tradeClose(closedTrade, pnl, "MANUAL", broker.getMode()));
+  logger.info(`✋ VENDA MANUAL (pedido da app) ${pos.assetSym} | P&L ${sign(pnl)}${eur(pnl)}`);
+  return { ok: true, pnl };
+}
+
+// ── Comprar a pedido do utilizador (via comando) ─────────────────────────────
+async function buyManual({ assetId, amount }) {
+  const price = prices.getFreshPrice(assetId);
+  if (!price) return { ok: false, reason: "sem preço real fresco para este ativo" };
+  // Reaproveita o caminho normal de compra, como uma "estratégia manual".
+  const fakeStrat = { id: "manual", nome: "Compra manual", sl: appSettings.stopLossPadrao || 6, tp: appSettings.takeProfitPadrao || 12, compra: 0, risco: "manual", perTrade: amount };
+  const before = Object.keys(openPositions).length;
+  await executeBuy(fakeStrat, assetId, price, 70);
+  const opened = Object.keys(openPositions).length > before;
+  return opened ? { ok: true } : { ok: false, reason: "não abriu (corretora recusou ou limite atingido)" };
+}
+
+// ── Processar a fila de comandos da app (compra/venda manual) ────────────────
+async function processCommands(currentPrices) {
+  let cmds;
+  try { cmds = await fb.fetchPendingCommands(); } catch { return; }
+  if (!cmds || !cmds.length) return;
+  for (const cmd of cmds) {
+    try {
+      if (cmd.type === "SELL" && cmd.posId) {
+        const r = await closePositionManual(cmd.posId, currentPrices);
+        await fb.markCommand(cmd.id, r.ok ? "FEITO" : "FALHOU", r.ok ? `P&L ${r.pnl}` : r.reason);
+      } else if (cmd.type === "BUY" && cmd.assetId) {
+        const amount = Math.max(10, Number(cmd.amount) || 0);
+        const r = await buyManual({ assetId: cmd.assetId, amount });
+        await fb.markCommand(cmd.id, r.ok ? "FEITO" : "FALHOU", r.ok ? "comprado" : r.reason);
+      } else {
+        await fb.markCommand(cmd.id, "FALHOU", "comando inválido");
+      }
+    } catch (e) {
+      await fb.markCommand(cmd.id, "FALHOU", e.message).catch(() => {});
+    }
+  }
+}
+
+module.exports = { init, processCommands };

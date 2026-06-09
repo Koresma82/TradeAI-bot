@@ -146,6 +146,8 @@ const SYMBOL_MAP = {
   btc:    "BTCUSD",  eth:    "ETHUSD",
   bnb:    "BNBUSD",  sol:    "SOLUSD",
   xrp:    "XRPUSD",  doge:   "DOGEUSD",
+  ada:    "ADAUSD",  avax:   "AVAXUSD",
+  dot:    "DOTUSD",  link:   "LINKUSD",
   spy:    "SPY",     qqq:    "QQQ",
   iwm:    "IWM",     gld:    "GLD",   // GLD = ETF do ouro
   tlt:    "TLT",     xle:    "XLE",
