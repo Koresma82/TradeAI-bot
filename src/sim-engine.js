@@ -50,6 +50,8 @@ let appSettings   = {
   takeProfitPadrao: 12,
   valorFixo: 100,
   maxDayTrading: 5,
+  maxValorTrade: 100,      // teto ABSOLUTO em € por trade (independente do saldo)
+  maxPosicoesTotal: 40,    // limite GLOBAL de posições abertas ao mesmo tempo
 };
 let dtConfig = null; // config de day trading lida da app (dtState)
 let simBalance    = parseFloat(process.env.SIM_CAPITAL || "1000");
@@ -227,7 +229,7 @@ async function checkSLTP(currentPrices) {
     stats.addClosedTrade(closedTrade);
     dailyLossHit = stats.checkDailyLossLimit();
 
-    await notify(tg.tradeClose(closedTrade, pnl, reason));
+    await notify(tg.tradeClose(closedTrade, pnl, reason, broker.getMode()));
   }
 }
 
@@ -237,10 +239,15 @@ async function checkSLTP(currentPrices) {
 function suggestAmount(assetId, confianca, strategy) {
   const avail = simBalance;
   if (!avail || avail <= 0) return strategy.perTrade || 10;
+  // Teto ABSOLUTO em € por trade (configurável na app). Impede que uma % do
+  // saldo de paper ($100k) gere posições gigantes — o problema dos €500/trade.
+  // 0, vazio ou indefinido = SEM teto (aplica só a %/valor fixo).
+  const tetoCfg = Number(appSettings.maxValorTrade);
+  const tetoAbs = (Number.isFinite(tetoCfg) && tetoCfg > 0) ? tetoCfg : Infinity;
 
   // Modo "fixo": respeita o valor fixo da estratégia/definições (comportamento clássico).
   if (appSettings.modoValor !== "percentagem") {
-    return Math.min(strategy.perTrade || appSettings.valorFixo || 10, avail);
+    return Math.min(strategy.perTrade || appSettings.valorFixo || 10, avail, tetoAbs);
   }
 
   // Modo "% da Banca": dimensiona pelo perfil de risco + confiança + saldo.
@@ -252,11 +259,10 @@ function suggestAmount(assetId, confianca, strategy) {
   const cfg = PERFIL[appSettings.riscoPerfil] || PERFIL.moderado;
   const c = Math.max(0, Math.min(100, confianca || 0));
   const mult = c >= 90 ? 2.0 : c >= 80 ? 1.5 : c >= 70 ? 1.1 : c >= 60 ? 0.8 : 0.5;
-  // Base: a % da banca definida nas Definições, escalada pela confiança, com teto do perfil.
   const pctBase = (appSettings.percentagem || 3) / 100;
   let amount = avail * pctBase * mult;
   amount = Math.min(amount, avail * cfg.teto);
-  amount = Math.max(10, Math.min(amount, avail));
+  amount = Math.max(10, Math.min(amount, avail, tetoAbs)); // ← teto absoluto aplicado aqui
   return +amount.toFixed(2);
 }
 
@@ -271,10 +277,20 @@ async function executeBuy(strategy, assetId, price, confianca) {
   }
   // Quantia: por perfil+confiança+saldo se modoInvestimento="auto", senão fixo.
   const sized  = suggestAmount(assetId, confianca, strategy);
-  const amount = Math.min(sized, parseFloat(process.env.MAX_POSITION_EUR || "500"));
+  // sized já vem com o teto aplicado por suggestAmount; aqui só reforçamos se
+  // houver teto configurado (0/vazio = sem teto).
+  const tetoCfg2 = Number(appSettings.maxValorTrade);
+  const amount = (Number.isFinite(tetoCfg2) && tetoCfg2 > 0) ? Math.min(sized, tetoCfg2) : sized;
 
   if (simBalance < amount) {
     logger.warn(`Saldo insuficiente: €${simBalance} < €${amount}`);
+    return;
+  }
+  // Limite GLOBAL de posições abertas (todas as origens). Evita centenas de
+  // posições quando o saldo de paper é enorme ($100k).
+  const maxTotal = Number(appSettings.maxPosicoesTotal);
+  if (Number.isFinite(maxTotal) && maxTotal > 0 && Object.keys(openPositions).length >= maxTotal) {
+    logger.warn(`Limite global de ${maxTotal} posições abertas atingido — compra ignorada`);
     return;
   }
   if (totalInvested + amount > parseFloat(process.env.MAX_TOTAL_EUR || simCapital)) {
@@ -403,8 +419,14 @@ function hasOpen(assetId, stratId) {
 // Abre uma posição de day trading (já com SL/TP decididos pela IA). Devolve true se abriu.
 async function openDayTrade({ assetId, assetName, assetSym, price, amount, sl, tp, previsao, confianca }) {
   if (dailyLossHit) return false;
-  const amt = Math.min(amount, parseFloat(process.env.MAX_POSITION_EUR || "500"));
+  const tetoDt = Number(appSettings.maxValorTrade);
+  const amt = (Number.isFinite(tetoDt) && tetoDt > 0) ? Math.min(amount, tetoDt) : amount;
   if (simBalance < amt) return false;
+  const maxTotDt = Number(appSettings.maxPosicoesTotal);
+  if (Number.isFinite(maxTotDt) && maxTotDt > 0 && Object.keys(openPositions).length >= maxTotDt) {
+    logger.warn(`Limite global de posições atingido — day-trade ${assetSym} ignorado`);
+    return false;
+  }
   if (totalInvested + amt > parseFloat(process.env.MAX_TOTAL_EUR || simCapital)) return false;
 
   const units = +(amt / price).toFixed(7);
@@ -439,6 +461,9 @@ async function runAiBrain(currentPrices) {
   const sigs = aiSignals.getSignals();
   for (const sg of Object.values(sigs)) {
     if (!sg || sg.sinal !== "COMPRAR" || (sg.confianca || 0) < minConf) continue;
+    // Limite global de posições abertas (0/vazio = sem limite)
+    const maxTotAi = Number(appSettings.maxPosicoesTotal);
+    if (Number.isFinite(maxTotAi) && maxTotAi > 0 && Object.keys(openPositions).length >= maxTotAi) break;
     if (!TRADEABLE.has(sg.id)) continue;
     // Não abrir em mercado fechado (evita flip-flop a preços congelados)
     if (!isMarketOpenFor(sg.id)) continue;
@@ -857,6 +882,8 @@ async function init() {
         modoValor:        val.modoValor || "fixo", // "fixo" | "percentagem"
         percentagem:      val.percentagem ?? 3,
         maxDayTrading:    val.maxDayTrading ?? 5,
+        maxValorTrade:    val.maxValorTrade ?? 100,
+        maxPosicoesTotal: val.maxPosicoesTotal ?? 40,
         aiSignalsMin:     val.aiSignalsMin ?? 15,
       };
       // Aplicar intervalo de sinais AI em tempo real
