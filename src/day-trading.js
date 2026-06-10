@@ -48,8 +48,12 @@ function isOpen(id) {
 }
 
 let lastScan = 0;
+let lastRlLog = 0;
 let rateLimitedUntil = 0;
-const SCAN_INTERVAL_MS = 5 * 60 * 1000; // 5 min, como na app
+// Intervalo de scan do Day Trading. Cada scan é 1 chamada Groq com vários ativos.
+// A 5 min eram 288 scans/dia — esgotava o free-tier sozinho, sobretudo a competir
+// com os sinais do Cérebro AI. Default agora 10 min (configurável por env).
+const SCAN_INTERVAL_MS = (parseInt(process.env.DT_SCAN_MIN || "10", 10)) * 60 * 1000;
 
 async function callGroq(messages, { max_tokens = 1200, temperature = 0.25 } = {}) {
   const r = await fetch("https://api.groq.com/openai/v1/chat/completions", {
@@ -71,8 +75,15 @@ async function run(dt, maxDayTrading, engine) {
   if (!GROQ_API_KEY) return;
   if (!dt || !dt.active) return;                 // monitor desligado na app
   const now = Date.now();
-  if (now < rateLimitedUntil) return;
-  if (now - lastScan < SCAN_INTERVAL_MS) return; // respeita o intervalo de 5 min
+  if (now < rateLimitedUntil) {
+    // Não fica "morto" em silêncio — avisa de vez em quando porque não opera.
+    if (now - lastRlLog > 5 * 60 * 1000) {
+      lastRlLog = now;
+      logger.warn(`⚡ DayTrading em pausa: Groq rate-limited por mais ~${Math.round((rateLimitedUntil - now)/60000)}min`);
+    }
+    return;
+  }
+  if (now - lastScan < SCAN_INTERVAL_MS) return; // respeita o intervalo configurável
 
   // Watchlist: ativos escolhidos na app, senão todos os tradeable. Só mercados abertos.
   let watch = (Array.isArray(dt.assets) && dt.assets.length)

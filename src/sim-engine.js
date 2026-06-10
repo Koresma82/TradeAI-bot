@@ -295,7 +295,10 @@ function suggestAmount(assetId, confianca, strategy) {
   // Modo "% da Banca": dimensiona pelo perfil de risco + confiança + saldo.
   const PERFIL = {
     conservador: { teto: 0.10, base: 0.04 },
+    scalper:     { teto: 0.12, base: 0.05 },
     moderado:    { teto: 0.20, base: 0.08 },
+    equilibrado: { teto: 0.18, base: 0.07 },
+    volatil:     { teto: 0.22, base: 0.09 },
     agressivo:   { teto: 0.33, base: 0.14 },
   };
   const cfg = PERFIL[appSettings.riscoPerfil] || PERFIL.moderado;
@@ -500,7 +503,33 @@ async function runAiBrain(currentPrices) {
   const slPct    = appSettings.stopLossPadrao || 6;
   const tpPct    = appSettings.takeProfitPadrao || 12;
 
-  const sigs = aiSignals.getSignals();
+  // Fonte de sinais: normalmente o Groq. Mas o Groq free-tier esgota e entra em
+  // rate-limit — e era isso que deixava o AI-Brain (e o Day Trading) sem fazer
+  // NADA, só sobrando as estratégias. FALLBACK: quando o Groq está indisponível,
+  // o AI-Brain age por INDICADORES TÉCNICOS locais (o mesmo motor das estratégias).
+  // Assim continua a operar sem depender de uma API instável.
+  let sigs = aiSignals.getSignals();
+  const groqHealth = aiSignals.getGroqHealth();
+  const usingFallback = !groqHealth.ok || !sigs || Object.keys(sigs).length === 0;
+  if (usingFallback) {
+    sigs = {};
+    for (const id of TRADEABLE) {
+      const pd = currentPrices[id];
+      if (!pd?.price) continue;
+      const daily = dailySeries[id] || [];
+      if (daily.length < 15) continue; // sem histórico não há sinal técnico fiável
+      const serie = [...daily.slice(-89), pd.price];
+      const tech = indicators.buySignal(serie, { dropTrigger: 1.5, rsiOversold: 35, smaLong: 50 });
+      if (tech.buy) {
+        // Converte o "score" técnico (0-100) em confiança equivalente do AI-Brain.
+        sigs[id] = { id, sinal: "COMPRAR", confianca: tech.score, razao: `técnico: ${tech.reason}`, ts: Date.now(), _fallback: true };
+      }
+    }
+    if (Object.keys(sigs).length && tickCount % 10 === 0) {
+      logger.info(`🤖 AI-Brain em FALLBACK técnico (Groq ${groqHealth.rateLimited ? "rate-limited" : "indisponível"}): ${Object.keys(sigs).length} sinal(is)`);
+    }
+  }
+
   for (const sg of Object.values(sigs)) {
     if (!sg || sg.sinal !== "COMPRAR" || (sg.confianca || 0) < minConf) continue;
     // Limite global de posições abertas (0/vazio = sem limite)
@@ -518,16 +547,19 @@ async function runAiBrain(currentPrices) {
     // ── Travão de sanidade: o Groq pode inflacionar confiança (diz 100% em
     //    ativos parados). Só entra se os INDICADORES TÉCNICOS também concordarem.
     //    Assim o AI Brain combina o "raciocínio" do LLM com dados objetivos. ──
-    const daily = dailySeries[sg.id] || [];
-    if (daily.length >= 15) {
-      const serie = [...daily.slice(-89), pd.price];
-      const tech = indicators.buySignal(serie, { dropTrigger: 1.0, rsiOversold: 45, smaLong: 50 });
-      if (!tech.buy) {
-        // Groq diz comprar mas os indicadores não confirmam → ignora (evita falsos sinais)
-        continue;
+    //    (Salta-se no fallback: o sinal JÁ é técnico, não precisa de re-confirmar.)
+    if (!sg._fallback) {
+      const daily = dailySeries[sg.id] || [];
+      if (daily.length >= 15) {
+        const serie = [...daily.slice(-89), pd.price];
+        const tech = indicators.buySignal(serie, { dropTrigger: 1.0, rsiOversold: 45, smaLong: 50 });
+        if (!tech.buy) {
+          // Groq diz comprar mas os indicadores não confirmam → ignora (evita falsos sinais)
+          continue;
+        }
       }
+      // (se não há histórico suficiente, confia só no Groq)
     }
-    // (se não há histórico suficiente, confia só no Groq — fallback)
 
     // cooldown 5 min por ativo
     if (Date.now() - (aiBrainCooldown[sg.id] || 0) < 5 * 60 * 1000) continue;
@@ -553,10 +585,15 @@ async function runAiBrain(currentPrices) {
     const sl    = +(price * (1 - slPct / 100)).toFixed(sg.id === "eurusd" ? 5 : 4);
     const tp    = +(price * (1 + tpPct / 100)).toFixed(sg.id === "eurusd" ? 5 : 4);
     const posId = `aibrain_${Date.now()}_${sg.id}`;
+    // Distinguir a origem do sinal: Groq (LLM) vs fallback técnico (indicadores).
+    // Útil para perceberes no histórico o que cada modo está a fazer.
+    const viaTecnico = !!sg._fallback;
     const position = {
       id: posId, assetId: sg.id, assetName: sg.id, assetSym: sg.id.toUpperCase(),
       entryPrice: price, units, amount: perTrade, peak: price, sl, tp,
-      strategy: `🤖 AI Brain (${sg.confianca}%)`, stratId: "ai-brain",
+      strategy: viaTecnico ? `🧮 AI Técnico (${sg.confianca}%)` : `🤖 AI Brain (${sg.confianca}%)`,
+      stratId: "ai-brain",
+      aiSource: viaTecnico ? "tecnico" : "groq", // origem do sinal (para a app filtrar/etiquetar)
       openedAt: new Date().toLocaleString("pt-PT"), openedTs: Date.now(), status: "ABERTA", mode: "sim",
     };
     openPositions[posId] = position;
@@ -567,7 +604,7 @@ async function runAiBrain(currentPrices) {
     await fb.saveTrade("server", position);
     await fb.saveBalance("server", simBalance);
     await notify(tg.tradeOpen(position, broker.getMode())).catch(() => {});
-    logger.info(`🤖 AI BRAIN BUY ${sg.id} | €${perTrade} @$${price} | confiança ${sg.confianca}%`);
+    logger.info(`${viaTecnico ? "🧮 AI TÉCNICO" : "🤖 AI BRAIN"} BUY ${sg.id} | €${perTrade} @$${price} | confiança ${sg.confianca}%`);
   }
 }
 
@@ -747,6 +784,10 @@ async function tick() {
       aiBrain:      !!appSettings.aiBrain,
       trailingStop: !!appSettings.trailingStop,
       aiExitOnFlip: appSettings.aiExitOnFlip !== false,
+      // AI-Brain a operar por indicadores técnicos porque o Groq está em baixo.
+      aiBrainFallback: !!appSettings.aiBrain && !aiSignals.getGroqHealth().ok,
+      scaleOutTP:   !!appSettings.scaleOutTP,
+      paused:       botPaused,
     };
     const featuresJson = JSON.stringify(features);
     if (featuresJson !== lastFeaturesJson || now - lastHeartbeatAt >= HEARTBEAT_MS) {
