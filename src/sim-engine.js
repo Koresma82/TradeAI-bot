@@ -56,6 +56,17 @@ let appSettings   = {
   maxPosicoesTotal: 40,    // limite GLOBAL de posições abertas ao mesmo tempo
   scaleOutTP: false,       // TP parcial desligado por defeito
   scaleOutPct: 50,
+  // Ajuste de SL/TP/queda por CATEGORIA de ativo. O perfil global dá os valores
+  // base; estes multiplicadores adaptam-nos à volatilidade típica de cada classe.
+  // Ex.: perfil SL 6% × crypto 1.5 = SL 9% para crypto; × forex 0.4 = SL 2.4%.
+  // 1.0 = usa o valor do perfil tal e qual. Editável na app.
+  catAjuste: {
+    Crypto:    1.5,
+    Commodity: 1.0,
+    ETF:       0.7,
+    Forex:     0.4,
+    Ação:      1.1,
+  },
 };
 let dtConfig = null; // config de day trading lida da app (dtState)
 let simBalance    = parseFloat(process.env.SIM_CAPITAL || "1000");
@@ -71,6 +82,24 @@ const eur  = v => `€${Math.abs(v).toFixed(2)}`;
 
 // Categorias por ativo (para saber se o mercado está aberto)
 const ASSET_CAT = Object.fromEntries(prices.ASSETS.map(a => [a.id, a.cat]));
+
+// Devolve o fator de ajuste de SL/TP/queda para a categoria de um ativo.
+// O perfil global dá o valor base; aqui multiplica-se pela volatilidade típica
+// da classe. Crypto mexe muito (SL/TP largos), forex pouco (apertados).
+function catFactor(assetId) {
+  const cat = ASSET_CAT[assetId];
+  const m = (appSettings.catAjuste || {})[cat];
+  return (typeof m === "number" && m > 0) ? m : 1.0;
+}
+// SL/TP/queda efetivos para um ativo: valor do perfil × fator da categoria.
+// clamps para evitar valores absurdos (SL/TP entre 0.3% e 60%, queda 0.1%-15%).
+function adjustedRisk(assetId, baseSl, baseTp, baseDrop) {
+  const f = catFactor(assetId);
+  const sl   = Math.min(60, Math.max(0.3, baseSl  * f));
+  const tp   = Math.min(60, Math.max(0.3, baseTp  * f));
+  const drop = baseDrop == null ? null : Math.min(15, Math.max(0.1, baseDrop * f));
+  return { sl, tp, drop, factor: f };
+}
 
 // Mercado aberto para um ativo?
 //  - Crypto: sempre (24/7)
@@ -382,8 +411,12 @@ async function executeBuy(strategy, assetId, price, confianca) {
   }
 
   const units = +(amount / price).toFixed(7);
-  const sl    = +(price * (1 - strategy.sl  / 100)).toFixed(4);
-  const tp    = +(price * (1 + strategy.tp  / 100)).toFixed(4);
+  // Ajuste por categoria: o SL/TP da estratégia é escalado pela volatilidade da
+  // classe do ativo (ex.: crypto mais largo, forex mais apertado).
+  const adj   = adjustedRisk(assetId, strategy.sl, strategy.tp, null);
+  const dp    = assetId === "eurusd" || ASSET_CAT[assetId] === "Forex" ? 5 : 4;
+  const sl    = +(price * (1 - adj.sl / 100)).toFixed(dp);
+  const tp    = +(price * (1 + adj.tp / 100)).toFixed(dp);
   const posId = `${broker.isLive() ? "live" : "sim"}_${Date.now()}_${assetId}`;
 
   // Fix 3 (atomicidade): em LIVE, gravamos primeiro um registo PENDING no
@@ -582,8 +615,9 @@ async function runAiBrain(currentPrices) {
 
     const price = pd.price;
     const units = +(perTrade / price).toFixed(7);
-    const sl    = +(price * (1 - slPct / 100)).toFixed(sg.id === "eurusd" ? 5 : 4);
-    const tp    = +(price * (1 + tpPct / 100)).toFixed(sg.id === "eurusd" ? 5 : 4);
+    const adjB  = adjustedRisk(sg.id, slPct, tpPct, null);
+    const sl    = +(price * (1 - adjB.sl / 100)).toFixed(sg.id === "eurusd" ? 5 : 4);
+    const tp    = +(price * (1 + adjB.tp / 100)).toFixed(sg.id === "eurusd" ? 5 : 4);
     const posId = `aibrain_${Date.now()}_${sg.id}`;
     // Distinguir a origem do sinal: Groq (LLM) vs fallback técnico (indicadores).
     // Útil para perceberes no histórico o que cada modo está a fazer.
@@ -677,11 +711,15 @@ async function tick() {
           const daily = dailySeries[assetId] || [];
           const serie = daily.length ? [...daily.slice(-89), priceData.price] : [];
 
+          // Queda de compra ajustada à volatilidade da categoria do ativo
+          // (crypto exige queda maior para entrar; forex menor).
+          const dropAdj = adjustedRisk(assetId, 1, 1, strategy.compra).drop;
+
           let sinal;
           if (serie.length >= 15) {
             // Temos histórico real → usa indicadores técnicos
             sinal = indicators.buySignal(serie, {
-              dropTrigger: strategy.compra,           // gatilho de queda da estratégia
+              dropTrigger: dropAdj,                   // gatilho de queda ajustado por categoria
               rsiOversold: strategy.risco === "alto" ? 45 : strategy.risco === "baixo" ? 30 : 38,
               smaLong:     50,
             });
@@ -689,7 +727,7 @@ async function tick() {
             // Fallback: ainda sem histórico → usa só a queda intradiária (como antes)
             const high = getRecentHigh(assetId);
             const dropPct = high ? ((high - priceData.price) / high) * 100 : 0;
-            sinal = { buy: dropPct >= strategy.compra, score: 60, reason: `queda ${dropPct.toFixed(1)}% (sem histórico)` };
+            sinal = { buy: dropPct >= dropAdj, score: 60, reason: `queda ${dropPct.toFixed(1)}% (sem histórico)` };
           }
 
           if (sinal.buy) {
@@ -1010,6 +1048,7 @@ async function init() {
       aiSignalsMin:     val.aiSignalsMin ?? 15,
       scaleOutTP:       val.scaleOutTP ?? false,   // TP parcial (vende fração, deixa correr)
       scaleOutPct:      val.scaleOutPct ?? 50,     // % a vender no TP parcial
+      catAjuste:        (val.catAjuste && typeof val.catAjuste === "object") ? val.catAjuste : appSettings.catAjuste,
     };
     aiSignals.setRefreshMinutes(appSettings.aiSignalsMin);
     logger.info(`Definições [${SETTINGS_DOC}]: máx ${appSettings.maxEstrategias} | rotação ${appSettings.rotacaoAtiva ? "ON" : "OFF"} | AI Brain ${appSettings.aiBrain ? `ON@${appSettings.aiBrainConfianca}%` : "OFF"} | Trailing ${appSettings.trailingStop ? `ON@${appSettings.trailingStopPct}%` : "OFF"} | teto €${appSettings.maxValorTrade} | Sinais ${appSettings.aiSignalsMin}min`);
