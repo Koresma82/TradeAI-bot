@@ -66,6 +66,17 @@ async function placeOrder({ symbol, qty, side, takeProfit, stopLoss }) {
   //  • Ações/ETF (ex.: SPY) → "day" e bracket nativo são suportados.
   const isCrypto = String(symbol).includes("/");
 
+  // Fix 3: a Alpaca NÃO aceita bracket (SL/TP nativo) em ordens de quantidade
+  // FRACIONÁRIA — só com qty inteira. Com teto baixo por trade (ex.: €100) e
+  // ações caras (SPY ~$470), a qty é fracionária e o bracket seria rejeitado,
+  // OU a ordem abria sem proteção nenhuma enquanto o motor julgava que a
+  // corretora a geria. Solução: só pedimos bracket quando a qty é inteira;
+  // caso contrário NÃO enviamos bracket e devolvemos bracketApplied=false para
+  // o motor saber que tem de gerir o SL/TP ele próprio.
+  const isWholeQty = Number.isInteger(qty) && qty >= 1;
+  const wantsBracket = !isCrypto && (takeProfit || stopLoss);
+  const useBracket   = wantsBracket && isWholeQty;
+
   const body = {
     symbol,
     qty:        qty.toFixed(8),
@@ -74,18 +85,21 @@ async function placeOrder({ symbol, qty, side, takeProfit, stopLoss }) {
     time_in_force: isCrypto ? "gtc" : "day",
   };
 
-  // Bracket (SL/TP nativo) só em ações/ETF — nunca em cripto.
-  if (!isCrypto && (takeProfit || stopLoss)) {
+  if (useBracket) {
     body.order_class = "bracket";
     if (takeProfit) body.take_profit = { limit_price: takeProfit.toFixed(2) };
     if (stopLoss)   body.stop_loss   = { stop_price:  stopLoss.toFixed(2)   };
+  } else if (wantsBracket && !isWholeQty) {
+    logger.warn(`Alpaca ${symbol}: qty ${qty} é fracionária — bracket nativo não suportado. Ordem simples; SL/TP fica a cargo do motor.`);
   }
 
   const order = await alpacaFetch("/v2/orders", {
     method: "POST",
     body:   JSON.stringify(body),
   });
-  logger.info(`Alpaca ordem: ${side.toUpperCase()} ${qty} ${symbol} | id: ${order.id}`);
+  // Anexa (não-persistente) se o bracket foi mesmo aplicado, para o adaptador.
+  if (order && typeof order === "object") order._bracketApplied = useBracket;
+  logger.info(`Alpaca ordem: ${side.toUpperCase()} ${qty} ${symbol}${useBracket ? " [bracket]" : ""} | id: ${order.id}`);
   return order;
 }
 
@@ -130,6 +144,31 @@ async function cancelOrder(orderId) {
   logger.info(`Alpaca cancelar ordem: ${orderId}`);
 }
 
+// ── Cancelar TODAS as ordens abertas de um símbolo ───────────────────────────
+// Fix 2: antes de fechar manualmente uma posição com bracket nativo, é preciso
+// cancelar as ordens-filhas (SL/TP) ainda abertas. Senão, ao fechar a posição,
+// a perna que sobra do bracket fica órfã e pode disparar depois → venda a
+// descoberto (short acidental). Devolve o nº de ordens canceladas.
+async function cancelOpenOrders(symbol) {
+  try {
+    // Inclui ordens aninhadas (as filhas do bracket vêm dentro de "legs").
+    const open = await alpacaFetch(`/v2/orders?status=open&symbols=${encodeURIComponent(symbol)}&nested=true`);
+    if (!Array.isArray(open) || !open.length) return 0;
+    let n = 0;
+    for (const o of open) {
+      const ids = [o.id, ...((o.legs || []).map(l => l.id))].filter(Boolean);
+      for (const id of ids) {
+        try { await cancelOrder(id); n++; } catch (e) { logger.warn(`Cancelar ordem ${id} falhou: ${e.message}`); }
+      }
+    }
+    if (n) logger.info(`Alpaca: ${n} ordem(ns) aberta(s) de ${symbol} cancelada(s) antes do fecho`);
+    return n;
+  } catch (e) {
+    logger.warn(`cancelOpenOrders(${symbol}) falhou: ${e.message}`);
+    return 0;
+  }
+}
+
 // ── Estado do mercado ─────────────────────────────────────────────────────────
 async function isMarketOpen() {
   const clock = await alpacaFetch("/v2/clock");
@@ -171,6 +210,7 @@ module.exports = {
   closePositionQty,
   getOrder,
   cancelOrder,
+  cancelOpenOrders,
   isMarketOpen,
   isLive,
   isConnected,

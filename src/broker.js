@@ -192,7 +192,7 @@ async function buy({ assetId, amount, price, sl, tp }) {
 }
 
 // ── VENDA / FECHO ──────────────────────────────────────────────────────────────
-async function sell({ assetId, units, price, broker: preferred }) {
+async function sell({ assetId, units, price, broker: preferred, hadBracket }) {
   if (!LIVE) {
     return { ok: true, fillPrice: price, simulated: true };
   }
@@ -200,7 +200,7 @@ async function sell({ assetId, units, price, broker: preferred }) {
   let a = preferred ? registry.byId(preferred) : null;
   if (!a || !a.isConnected() || !a.supports(assetId)) a = pickAdapter(assetId);
   if (!a) return { ok: false, reason: `sem broker para ${assetId}` };
-  const res = await a.sell({ assetId, units, price });
+  const res = await a.sell({ assetId, units, price, hadBracket });
   if (res.ok) logger.info(`↘ ${a.id} SELL ${assetId} | ${units} @ $${res.fillPrice}`);
   return { ...res, broker: a.id };
 }

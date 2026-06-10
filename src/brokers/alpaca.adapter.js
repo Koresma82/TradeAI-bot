@@ -108,6 +108,10 @@ module.exports = {
       // sinaliza pending=true para o motor saber que o preço/units são provisórios.
       const filledPrice = order.filled_avg_price ? parseFloat(order.filled_avg_price) : null;
       const filledQty   = order.filled_qty ? parseFloat(order.filled_qty) : null;
+      // Fix 3: o bracket só conta se foi MESMO aplicado (qty inteira). Em ações
+      // de qty fracionária a Alpaca não aceita bracket — nesse caso é o motor
+      // que gere o SL/TP, por isso brokerSLTP tem de ser false.
+      const bracketApplied = !isCrypto(assetId) && order._bracketApplied === true;
       return {
         ok: true,
         fillPrice: filledPrice || price,
@@ -115,7 +119,7 @@ module.exports = {
         pending:   !filledPrice,              // true → preço/units provisórios
         brokerOrderId: order.id,
         brokerSymbol:  brokerSymbolKey(assetId),
-        bracket:   !isCrypto(assetId),        // SL/TP geridos pela corretora
+        bracket:   bracketApplied,            // SL/TP geridos pela corretora SÓ se bracket real
         simulated: false,
       };
     } catch (err) {
@@ -124,12 +128,18 @@ module.exports = {
     }
   },
 
-  async sell({ assetId, units, price }) {
+  async sell({ assetId, units, price, hadBracket }) {
     const symbol = orderSymbol(assetId);
     try {
+      const closeSym = isCrypto(assetId) ? symbol.replace("/", "") : symbol;
+      // Fix 2: se a posição era gerida por bracket nativo, cancelar PRIMEIRO as
+      // ordens-filhas (SL/TP) abertas. Senão a perna que sobra fica órfã e pode
+      // disparar depois → short acidental. Só faz sentido em não-crypto.
+      if (hadBracket && !isCrypto(assetId)) {
+        await alpaca.cancelOpenOrders(closeSym);
+      }
       // Fix 1: fechar pela QUANTIDADE da nossa posição (não a posição inteira do
       // símbolo, que poderia incluir outras), e capturar o preço REAL de fill.
-      const closeSym = isCrypto(assetId) ? symbol.replace("/", "") : symbol;
       const order = await alpaca.closePositionQty(closeSym, units);
       const fillPrice = order?.filled_avg_price ? parseFloat(order.filled_avg_price) : (price || null);
       const filledQty = order?.filled_qty ? parseFloat(order.filled_qty) : null;

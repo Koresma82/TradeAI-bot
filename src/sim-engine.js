@@ -22,6 +22,8 @@ let priceHistory  = {};  // { assetId: [{ price, ts }] } — intradiário (curto
 let dailySeries   = {};  // { assetId: [fechos diários] } — para indicadores (RSI/MM)
 let noPriceWarned = {};  // { assetId: ts } — controlo de avisos "sem preço"
 let lastBuyTime   = {};  // cooldown por estratégia/ativo
+let lastLossTime  = {};  // cooldown pós-perda por ativo (mais longo após um SL)
+let botPaused     = false; // pausa de novas entradas (toggle na app; SL/TP continua)
 let tickCount     = 0;
 let totalInvested = 0;
 let dailyLossHit  = false;
@@ -52,6 +54,8 @@ let appSettings   = {
   maxDayTrading: 5,
   maxValorTrade: 100,      // teto ABSOLUTO em € por trade (independente do saldo)
   maxPosicoesTotal: 40,    // limite GLOBAL de posições abertas ao mesmo tempo
+  scaleOutTP: false,       // TP parcial desligado por defeito
+  scaleOutPct: 50,
 };
 let dtConfig = null; // config de day trading lida da app (dtState)
 let simBalance    = parseFloat(process.env.SIM_CAPITAL || "1000");
@@ -180,6 +184,39 @@ async function checkSLTP(currentPrices) {
       }
     }
     else if (!onHold && price >= pos.tp) {
+      // ── TAKE-PROFIT PARCIAL (scale-out) — opcional, melhora retorno ────────
+      // Em vez de "tudo ou nada" no TP, vende uma fração (default 50%) e deixa
+      // o resto correr com o SL movido para break-even (entryPrice). Captura
+      // lucro garantido e mantém exposição ao upside. Só em crypto (não mexe
+      // em posições com bracket nativo) e só uma vez por posição.
+      const scaleOn = appSettings.scaleOutTP === true && !pos.brokerSLTP && !pos.scaledOut;
+      if (scaleOn) {
+        const frac = Math.min(0.9, Math.max(0.1, (appSettings.scaleOutPct ?? 50) / 100));
+        const sellUnits = +(pos.units * frac).toFixed(7);
+        let partialClose = Math.max(price, pos.tp);
+        if (broker.isLive()) {
+          const exec = await broker.sell({ assetId: pos.assetId, units: sellUnits, price: partialClose, broker: pos.broker, hadBracket: false });
+          if (!exec.ok) { logger.warn(`Scale-out ${pos.assetSym} falhou: ${exec.reason}`); /* tenta fecho normal abaixo */ }
+          else if (typeof exec.fillPrice === "number" && exec.fillPrice > 0) partialClose = exec.fillPrice;
+        }
+        const soldAmount = pos.amount * frac;
+        const feeP = broker.roundTripFee(pos.assetId, soldAmount);
+        const pnlP = +(((partialClose - pos.entryPrice) * sellUnits) - feeP).toFixed(4);
+        // Atualiza a posição: fica com o restante e SL em break-even.
+        pos.units  = +(pos.units - sellUnits).toFixed(7);
+        pos.amount = +(pos.amount - soldAmount).toFixed(2);
+        pos.sl     = Math.max(pos.sl, pos.entryPrice); // protege o lucro já feito
+        pos.tp     = +(pos.tp * (1 + ((appSettings.takeProfitPadrao || 12) / 100))).toFixed(6); // novo alvo mais alto
+        pos.scaledOut = true;
+        totalInvested = Math.max(0, totalInvested - soldAmount);
+        simBalance = +(simBalance + soldAmount + pnlP).toFixed(2);
+        await fb.updateTrade("server", posId, { units: pos.units, amount: pos.amount, sl: pos.sl, tp: pos.tp, scaledOut: true, partialPnl: pnlP }).catch(() => {});
+        await fb.saveBalance("server", simBalance);
+        stats.addClosedTrade({ ...pos, id: `${posId}_p`, units: sellUnits, amount: soldAmount, status: "TP-PARCIAL", closePrice: partialClose, pnl: pnlP, fee: feeP, closedTs: Date.now() });
+        logger.info(`📊 TP parcial ${pos.assetSym}: vendeu ${(frac*100).toFixed(0)}% (+${eur(pnlP)}), resto corre com SL em break-even`);
+        await notify(`📊 *TP parcial* ${pos.assetSym}\nVendido ${(frac*100).toFixed(0)}% · +${eur(pnlP)}\nResto a correr (SL em break-even)`).catch(() => {});
+        continue; // não fecha tudo — o resto continua aberto
+      }
       reason = "TP";
       closePrice = Math.max(price, pos.tp); // idem: preço real, não o TP teórico
     }
@@ -188,7 +225,7 @@ async function checkSLTP(currentPrices) {
 
     // ── Executar a venda real na Alpaca se em modo live ──
     if (broker.isLive()) {
-      const exec = await broker.sell({ assetId: pos.assetId, units: pos.units, price: closePrice, broker: pos.broker });
+      const exec = await broker.sell({ assetId: pos.assetId, units: pos.units, price: closePrice, broker: pos.broker, hadBracket: !!pos.brokerSLTP });
       if (!exec.ok) {
         logger.warn(`Venda ${pos.assetSym} falhou: ${exec.reason} — tenta no próximo tick`);
         continue; // não fecha localmente se a corretora recusou
@@ -222,6 +259,11 @@ async function checkSLTP(currentPrices) {
     delete openPositions[posId];
     totalInvested = Math.max(0, totalInvested - pos.amount);
     simBalance    = +(simBalance + pos.amount + pnl).toFixed(2);
+
+    // Cooldown pós-perda: se fechámos a perder (SL), regista para impor uma
+    // pausa MAIOR antes de reentrar neste ativo. Evita o "apanhar a faca a cair"
+    // — reentrar repetidamente num ativo em queda livre (o padrão SOL/XRP).
+    if (pnl < 0) lastLossTime[pos.assetId] = Date.now();
 
     // Guarda no Firestore
     await fb.updateTrade("server", posId, { status: reason, closePrice, pnl, fee, pnlBruto: closedTrade.pnlBruto, closedAt: closedTrade.closedAt, closedTs });
@@ -489,6 +531,9 @@ async function runAiBrain(currentPrices) {
 
     // cooldown 5 min por ativo
     if (Date.now() - (aiBrainCooldown[sg.id] || 0) < 5 * 60 * 1000) continue;
+    // cooldown pós-perda (mais longo após um SL neste ativo)
+    const aiLossCdMs = (parseInt(process.env.POSTLOSS_COOLDOWN_MIN || "30", 10)) * 60000;
+    if (Date.now() - (lastLossTime[sg.id] || 0) < aiLossCdMs) continue;
     // não duplicar posição AI no mesmo ativo
     if (Object.values(openPositions).some(p => p.assetId === sg.id && p.stratId === "ai-brain")) continue;
     // limites
@@ -560,6 +605,13 @@ async function tick() {
     // 2b. Processar comandos manuais da app (compra/venda pedida pelo utilizador)
     await processCommands(currentPrices);
 
+    // ── PAUSA: quando o bot está pausado (toggle na app, útil em deploys), NÃO
+    // abre novas posições — mas continua a proteger as abertas (SL/TP acima já
+    // correu) e a processar vendas/comandos. Pausar nunca desativa a proteção.
+    if (botPaused) {
+      if (tickCount % 10 === 0) logger.info("⏸ Bot PAUSADO — só gestão de posições abertas (SL/TP/vendas). Sem novas entradas.");
+    } else {
+
     // 3. Verificar sinais das estratégias
     if (!dailyLossHit) {
       for (const strategy of strategies) {
@@ -577,6 +629,10 @@ async function tick() {
           const cooldownMs = (parseInt(process.env.REENTRY_COOLDOWN_MIN || "10", 10)) * 60000;
           const lastBuy = lastBuyTime[cdKey] || 0;
           if (Date.now() - lastBuy < cooldownMs) continue;
+          // Cooldown pós-perda (mais longo): após um SL neste ativo, espera mais
+          // antes de reentrar. Default = 3x o cooldown normal. Configurável.
+          const lossCdMs = (parseInt(process.env.POSTLOSS_COOLDOWN_MIN || "30", 10)) * 60000;
+          if (Date.now() - (lastLossTime[assetId] || 0) < lossCdMs) continue;
 
           // ── Sinal realista: combina histórico diário (RSI + média móvel)
           //    com a queda intradiária recente. Precisa de ≥2 critérios. ──
@@ -621,6 +677,8 @@ async function tick() {
     await dayTrading.run(dtConfig, appSettings.maxDayTrading || 5, {
       openDayTrade, countDayTrades, hasOpen,
     }).catch(err => logger.warn(`DayTrading run: ${err.message}`));
+
+    } // fim do gate de pausa (botPaused)
 
     // 3b. Log de diagnóstico (a cada 10 ticks) — mostra estado dos sinais
     if (tickCount % 10 === 0 && strategies.length > 0) {
@@ -878,31 +936,62 @@ async function init() {
     logger.info(`Estratégias: ${strategies.map(s => s.nome).join(", ") || "nenhuma"}`);
   });
 
-  // Subscrever definições da app (limites, rotação, automação AI)
-  fb.watchSetting("settings", (val) => {
+  // Subscrever definições da app conforme o MODO do bot:
+  //   sim   → settings/settings
+  //   paper → settings/paperSettings  (fallback: liveSettings → settings)
+  //   real  → settings/realSettings   (fallback: liveSettings → settings)
+  // Assim cada modo tem o seu próprio conjunto de limites/risco, e o real nunca
+  // herda acidentalmente definições agressivas de simulação.
+  const MODE_NOW = broker.getMode();
+  const SETTINGS_DOC = MODE_NOW === "real" ? "realSettings"
+                     : MODE_NOW === "paper" ? "paperSettings"
+                     : "settings";
+  let settingsBaseLoaded = false; // trava o fallback assim que chega o doc específico
+  const applySettings = (val) => {
+    if (!val || typeof val !== "object") return;
+    appSettings = {
+      maxEstrategias:   val.maxEstrategias ?? 5,
+      rotacaoAtiva:     val.rotacaoAtiva ?? false,
+      aiBrain:          val.aiBrain ?? false,
+      aiBrainConfianca: val.aiBrainConfianca ?? 78,
+      trailingStop:     val.trailingStop ?? false,
+      trailingStopPct:  val.trailingStopPct ?? 4,
+      aiExitOnFlip:     val.aiExitOnFlip ?? true,
+      stopLossPadrao:   val.stopLossPadrao ?? 6,
+      takeProfitPadrao: val.takeProfitPadrao ?? 12,
+      valorFixo:        val.valorFixo ?? 100,
+      riscoPerfil:      (val.riscoPerfil || "moderado").toLowerCase(),
+      modoValor:        val.modoValor || "fixo", // "fixo" | "percentagem"
+      percentagem:      val.percentagem ?? 3,
+      maxDayTrading:    val.maxDayTrading ?? 5,
+      maxValorTrade:    val.maxValorTrade ?? 100,
+      maxPosicoesTotal: val.maxPosicoesTotal ?? 40,
+      aiSignalsMin:     val.aiSignalsMin ?? 15,
+      scaleOutTP:       val.scaleOutTP ?? false,   // TP parcial (vende fração, deixa correr)
+      scaleOutPct:      val.scaleOutPct ?? 50,     // % a vender no TP parcial
+    };
+    aiSignals.setRefreshMinutes(appSettings.aiSignalsMin);
+    logger.info(`Definições [${SETTINGS_DOC}]: máx ${appSettings.maxEstrategias} | rotação ${appSettings.rotacaoAtiva ? "ON" : "OFF"} | AI Brain ${appSettings.aiBrain ? `ON@${appSettings.aiBrainConfianca}%` : "OFF"} | Trailing ${appSettings.trailingStop ? `ON@${appSettings.trailingStopPct}%` : "OFF"} | teto €${appSettings.maxValorTrade} | Sinais ${appSettings.aiSignalsMin}min`);
+  };
+  fb.watchSetting(SETTINGS_DOC, (val) => {
+    if (val && typeof val === "object") { settingsBaseLoaded = true; applySettings(val); }
+  });
+  // Fallback de migração: enquanto o doc específico não existir, em paper/real
+  // usamos o antigo "liveSettings"; em qualquer modo, "settings" como último recurso.
+  if (SETTINGS_DOC !== "settings") {
+    fb.watchSetting("liveSettings", (val) => { if (!settingsBaseLoaded && val) applySettings(val); });
+  }
+
+  // Subscrever controlo de pausa do bot (toggle na app). Pausar impede novas
+  // entradas mas mantém SL/TP e vendas — seguro para usar antes de um deploy.
+  fb.watchSetting("botControl", (val) => {
     if (val && typeof val === "object") {
-      appSettings = {
-        maxEstrategias:   val.maxEstrategias ?? 5,
-        rotacaoAtiva:     val.rotacaoAtiva ?? false,
-        aiBrain:          val.aiBrain ?? false,
-        aiBrainConfianca: val.aiBrainConfianca ?? 78,
-        trailingStop:     val.trailingStop ?? false,
-        trailingStopPct:  val.trailingStopPct ?? 4,
-        aiExitOnFlip:     val.aiExitOnFlip ?? true,
-        stopLossPadrao:   val.stopLossPadrao ?? 6,
-        takeProfitPadrao: val.takeProfitPadrao ?? 12,
-        valorFixo:        val.valorFixo ?? 100,
-        riscoPerfil:      (val.riscoPerfil || "moderado").toLowerCase(),
-        modoValor:        val.modoValor || "fixo", // "fixo" | "percentagem"
-        percentagem:      val.percentagem ?? 3,
-        maxDayTrading:    val.maxDayTrading ?? 5,
-        maxValorTrade:    val.maxValorTrade ?? 100,
-        maxPosicoesTotal: val.maxPosicoesTotal ?? 40,
-        aiSignalsMin:     val.aiSignalsMin ?? 15,
-      };
-      // Aplicar intervalo de sinais AI em tempo real
-      aiSignals.setRefreshMinutes(appSettings.aiSignalsMin);
-      logger.info(`Definições: máx ${appSettings.maxEstrategias} | rotação ${appSettings.rotacaoAtiva ? "ON" : "OFF"} | AI Brain ${appSettings.aiBrain ? `ON@${appSettings.aiBrainConfianca}%` : "OFF"} | Trailing ${appSettings.trailingStop ? `ON@${appSettings.trailingStopPct}%` : "OFF"} | Sinais ${appSettings.aiSignalsMin}min`);
+      const next = !!val.paused;
+      if (next !== botPaused) {
+        botPaused = next;
+        logger.info(`Bot ${botPaused ? "PAUSADO ⏸ (sem novas entradas)" : "RETOMADO ▶ (entradas ativas)"}`);
+        notify(botPaused ? "⏸ *Bot pausado* — sem novas entradas. SL/TP continuam ativos." : "▶ *Bot retomado* — entradas ativas.").catch(() => {});
+      }
     }
   });
 
@@ -983,7 +1072,7 @@ async function closePositionManual(posId, currentPrices) {
   if (!closePrice) return { ok: false, reason: "sem preço real fresco — tenta daqui a pouco" };
 
   if (broker.isLive()) {
-    const exec = await broker.sell({ assetId: pos.assetId, units: pos.units, price: closePrice, broker: pos.broker });
+    const exec = await broker.sell({ assetId: pos.assetId, units: pos.units, price: closePrice, broker: pos.broker, hadBracket: !!pos.brokerSLTP });
     if (!exec.ok) return { ok: false, reason: `corretora recusou: ${exec.reason}` };
     if (typeof exec.fillPrice === "number" && exec.fillPrice > 0) closePrice = exec.fillPrice;
   }
@@ -1026,6 +1115,7 @@ async function processCommands(currentPrices) {
         const r = await closePositionManual(cmd.posId, currentPrices);
         await fb.markCommand(cmd.id, r.ok ? "FEITO" : "FALHOU", r.ok ? `P&L ${r.pnl}` : r.reason);
       } else if (cmd.type === "BUY" && cmd.assetId) {
+        if (botPaused) { await fb.markCommand(cmd.id, "FALHOU", "bot pausado — sem novas entradas"); continue; }
         const amount = Math.max(10, Number(cmd.amount) || 0);
         const r = await buyManual({ assetId: cmd.assetId, amount });
         await fb.markCommand(cmd.id, r.ok ? "FEITO" : "FALHOU", r.ok ? "comprado" : r.reason);

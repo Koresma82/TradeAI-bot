@@ -1,0 +1,48 @@
+rules_version = '2';
+
+// ─────────────────────────────────────────────────────────────────────────────
+// TradeAI — Regras de segurança do Firestore
+// ─────────────────────────────────────────────────────────────────────────────
+// PRINCÍPIO: todos os dados vivem sob users/{uid}/... e SÓ o próprio utilizador
+// autenticado (request.auth.uid == uid) pode ler ou escrever os seus dados.
+//
+// • A APP (SDK cliente) está sujeita a estas regras → só acede ao próprio UID.
+// • O BOT (Admin SDK no Railway) IGNORA estas regras (privilégios de servidor),
+//   por isso continua a ler/escrever em users/{USER_UID}/... sem problema.
+//
+// Sem isto, qualquer pessoa com a config pública do Firebase (que vai no bundle
+// do site) poderia escrever um comando BUY/SELL que o bot executa com dinheiro
+// REAL. Estas regras fecham essa porta.
+//
+// COMO PUBLICAR:
+//   firebase deploy --only firestore:rules
+// ou cola o conteúdo em Firebase Console → Firestore Database → Rules → Publicar.
+// ─────────────────────────────────────────────────────────────────────────────
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // Verdadeiro só se houver login e o UID do pedido for o dono deste espaço.
+    function isOwner(userId) {
+      return request.auth != null && request.auth.uid == userId;
+    }
+
+    // Tudo sob o documento do utilizador e respetivas subcoleções.
+    match /users/{userId} {
+
+      // O próprio documento users/{userId} (caso exista).
+      allow read, write: if isOwner(userId);
+
+      // Qualquer subcoleção (strategies, trades, commands, settings, stats,
+      // archives, errors, …) e qualquer profundidade abaixo dela.
+      match /{document=**} {
+        allow read, write: if isOwner(userId);
+      }
+    }
+
+    // Nega tudo o resto explicitamente (defesa em profundidade).
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}

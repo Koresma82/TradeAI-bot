@@ -9,10 +9,15 @@ const prices = require("./prices");
 const GROQ_API_KEY = process.env.GROQ_API_KEY;
 const GROQ_MODEL   = process.env.GROQ_MODEL || "llama-3.1-8b-instant";
 
-// Mesmos ativos negociáveis do resto do bot.
-const TRADEABLE = ["btc","eth","wti","gold","silver","spy","qqq","gld","eurusd","gbpusd"];
+// Universo do Day Trading. Crypto (24/7) + ETFs/commodities em sessão US.
+// Inclui agora os crypto que negoceias de facto (SOL/XRP/ADA/AVAX/DOT/LINK),
+// que antes ficavam de fora — o DT nunca lhes tocava mesmo ligado.
+const TRADEABLE = ["btc","eth","sol","xrp","ada","avax","dot","link","wti","gold","silver","spy","qqq","gld","eurusd","gbpusd"];
 const META = {
   btc:{nome:"Bitcoin",sym:"BTC"}, eth:{nome:"Ethereum",sym:"ETH"},
+  sol:{nome:"Solana",sym:"SOL"}, xrp:{nome:"XRP",sym:"XRP"},
+  ada:{nome:"Cardano",sym:"ADA"}, avax:{nome:"Avalanche",sym:"AVAX"},
+  dot:{nome:"Polkadot",sym:"DOT"}, link:{nome:"Chainlink",sym:"LINK"},
   wti:{nome:"Petróleo WTI",sym:"WTI"}, gold:{nome:"Ouro",sym:"XAU"},
   silver:{nome:"Prata",sym:"XAG"}, spy:{nome:"S&P 500 ETF",sym:"SPY"},
   qqq:{nome:"Nasdaq ETF",sym:"QQQ"}, gld:{nome:"Gold ETF",sym:"GLD"},
@@ -27,7 +32,9 @@ const HOURS = {
   forex:     { openH: 0,    closeH: 21, weekdays: true },
 };
 const CAT = {
-  btc:"crypto", eth:"crypto", wti:"commodity", gold:"commodity", silver:"commodity",
+  btc:"crypto", eth:"crypto", sol:"crypto", xrp:"crypto", ada:"crypto",
+  avax:"crypto", dot:"crypto", link:"crypto",
+  wti:"commodity", gold:"commodity", silver:"commodity",
   spy:"etf", qqq:"etf", gld:"etf", eurusd:"forex", gbpusd:"forex",
 };
 function isOpen(id) {
