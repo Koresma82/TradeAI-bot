@@ -43,10 +43,13 @@ async function testConnection() {
 }
 
 // Etiqueta do modo para as mensagens (distingue os três modos claramente)
-const modeLabel = (mode) =>
-  mode === "real"  ? "🔴 REAL"
-  : mode === "paper" ? "🟡 PAPER"
-  : "🟢 SIMULAÇÃO";
+const modeLabel = (mode) => {
+  const m = String(mode || "").toLowerCase();
+  if (m === "real")  return "🔴 REAL";
+  if (m === "paper") return "🟡 PAPER";
+  if (m === "sim")   return "🟢 SIMULAÇÃO";
+  return `⚪ ${m.toUpperCase() || "DESCONHECIDO"}`; // valor inesperado → mostra-o, nunca finge ser real/paper
+};
 
 // Mensagens formatadas
 const tg = {

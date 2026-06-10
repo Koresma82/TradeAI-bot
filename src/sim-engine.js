@@ -444,7 +444,7 @@ async function openDayTrade({ assetId, assetName, assetSym, price, amount, sl, t
 
   await fb.saveTrade("server", position);
   await fb.saveBalance("server", simBalance);
-  await notify(tg.tradeOpen(position, "daytrade")).catch(() => {});
+  await notify(tg.tradeOpen(position, broker.getMode())).catch(() => {});
   logger.info(`⚡ DAYTRADE BUY ${assetId} | €${amt} @$${price} | SL $${sl} | TP $${tp} | conf ${confianca}%`);
   return true;
 }
