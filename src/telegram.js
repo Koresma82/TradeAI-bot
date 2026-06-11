@@ -2,6 +2,23 @@
 const TelegramBot = require("node-telegram-bot-api");
 const logger      = require("./logger");
 
+// Duração legível entre dois timestamps (ms) → "2h15m", "45m", "30s".
+function fmtDur(fromTs, toTs) {
+  if (!fromTs || !toTs || toTs < fromTs) return null;
+  const s = Math.floor((toTs - fromTs) / 1000);
+  if (s < 60) return `${s}s`;
+  const m = Math.floor(s / 60);
+  if (m < 60) return `${m}m`;
+  const h = Math.floor(m / 60);
+  return `${h}h${String(m % 60).padStart(2, "0")}m`;
+}
+// Só a hora HH:MM de um openedAt/closedAt no formato pt-PT, se existir.
+function horaDe(str) {
+  if (!str || typeof str !== "string") return null;
+  const m = str.match(/\b(\d{1,2}:\d{2})(:\d{2})?\b/);
+  return m ? m[1] : null;
+}
+
 let bot;
 
 function initTelegram() {
@@ -23,6 +40,47 @@ async function notify(msg) {
   } catch (e) {
     logger.warn(`Telegram erro: ${e.message}`);
     return false;
+  }
+}
+
+// ── Agrupamento de aberturas ────────────────────────────────────────────────
+// Em vez de uma mensagem por cada compra (que causava spam com rotação/day-trade/
+// AI), as aberturas entram numa fila e são enviadas num RESUMO periódico.
+// Os fechos (vendas) continuam imediatos — são menos e mais importantes.
+let _openQueue = [];
+let _openTimer = null;
+const OPEN_DIGEST_MIN = parseInt(process.env.TG_OPEN_DIGEST_MIN || "5"); // resumo a cada 5 min
+
+function _flushOpenQueue() {
+  if (!_openQueue.length) return;
+  const items = _openQueue; _openQueue = [];
+  // Agrupa por origem (estratégia/AI/day-trade) para leitura fácil.
+  const porOrigem = {};
+  for (const it of items) {
+    const k = it.origem || "Outros";
+    (porOrigem[k] = porOrigem[k] || []).push(it);
+  }
+  const linhas = [`📈 *${items.length} COMPRA${items.length > 1 ? "S" : ""} nos últimos ${OPEN_DIGEST_MIN}min*${items[0]?.mode ? ` _(${modeLabel(items[0].mode)})_` : ""}`];
+  for (const [origem, lista] of Object.entries(porOrigem)) {
+    linhas.push(`\n*${origem}* (${lista.length}):`);
+    for (const it of lista) {
+      linhas.push(`• ${it.assetSym} @ $${it.entryPrice} · €${it.amount}${it.confianca ? ` · ${it.confianca}%` : ""}`);
+    }
+  }
+  notify(linhas.join("\n")).catch(() => {});
+}
+
+// Adiciona uma abertura à fila (em vez de notificar já). Arranca o timer do resumo.
+function queueOpen(t, mode) {
+  _openQueue.push({
+    assetSym: t.assetSym || t.assetId, entryPrice: t.entryPrice, amount: t.amount,
+    confianca: t.confianca, origem: t.origemLabel || t.strategy || "Estratégia", mode,
+  });
+  // Proteção: se a fila ficar muito grande, envia já (evita acumular demasiado).
+  if (_openQueue.length >= 25) { _flushOpenQueue(); return; }
+  if (!_openTimer) {
+    _openTimer = setInterval(_flushOpenQueue, OPEN_DIGEST_MIN * 60 * 1000);
+    if (_openTimer.unref) _openTimer.unref();
   }
 }
 
@@ -56,16 +114,29 @@ const tg = {
   tradeOpen: (t, mode) =>
     `📈 *${modeLabel(mode)} — COMPRA EXECUTADA*\n` +
     `Ativo: *${t.assetName}* (${t.assetSym})\n` +
-    `Preço entrada: $${t.entryPrice}\n` +
+    `Preço entrada: $${t.entryPrice}${horaDe(t.openedAt) ? ` · ${horaDe(t.openedAt)}` : ""}\n` +
     `Valor: €${t.amount} · ${t.units} unidades\n` +
     `SL: $${t.sl} · TP: $${t.tp}\n` +
     `Estratégia: _${t.strategy}_`,
 
-  tradeClose: (t, pnl, reason, mode) =>
-    `${pnl >= 0 ? "✅" : "🛑"} *${reason} — POSIÇÃO FECHADA*${mode ? ` _(${modeLabel(mode)})_` : ""}\n` +
-    `Ativo: *${t.assetName}*\n` +
-    `P&L: *${pnl >= 0 ? "+" : ""}€${pnl.toFixed(2)}*\n` +
-    `Entrada: $${t.entryPrice} → Saída: $${t.closePrice}`,
+  tradeClose: (t, pnl, reason, mode) => {
+    const pct = (t.entryPrice && t.closePrice)
+      ? ((t.closePrice - t.entryPrice) / t.entryPrice) * 100 : null;
+    const hIn  = horaDe(t.openedAt);
+    const hOut = horaDe(t.closedAt);
+    const dur  = fmtDur(t.openedTs, t.closedTs);
+    const linhas = [
+      `${pnl >= 0 ? "✅" : "🛑"} *${reason} — POSIÇÃO FECHADA*${mode ? ` _(${modeLabel(mode)})_` : ""}`,
+      `Ativo: *${t.assetName}*${t.assetSym ? ` (${t.assetSym})` : ""}`,
+      `P&L: *${pnl >= 0 ? "+" : ""}€${pnl.toFixed(2)}*${pct != null ? ` (${pct >= 0 ? "+" : ""}${pct.toFixed(2)}%)` : ""}`,
+      `Entrada: $${t.entryPrice} → Saída: $${t.closePrice}`,
+    ];
+    if (hIn || hOut) linhas.push(`Hora: ${hIn || "?"} → ${hOut || "?"}${dur ? ` · durou ${dur}` : ""}`);
+    if (typeof t.amount === "number") linhas.push(`Investido: €${t.amount}`);
+    if (typeof t.fee === "number" && t.fee > 0) linhas.push(`Comissão: €${t.fee.toFixed(2)}`);
+    if (t.origem || t.strategy) linhas.push(`Origem: _${t.origem || t.strategy}_`);
+    return linhas.join("\n");
+  },
 
   dailyReport: (stats) =>
     `📊 *Relatório Diário TradeAI*\n\n` +
@@ -102,4 +173,4 @@ const tg = {
   },
 };
 
-module.exports = { initTelegram, notify, testConnection, tg };
+module.exports = { initTelegram, notify, queueOpen, testConnection, tg };

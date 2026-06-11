@@ -45,6 +45,7 @@ let appSettings   = {
   riscoPerfil: "moderado",
   modoValor: "fixo",
   rotacaoAtiva: false,
+  rotacaoMinPct: 1,        // lucro mínimo (%) para a rotação disparar (evita microtrading)
   // Automação avançada com IA
   aiBrain: false,
   aiBrainConfianca: 78,
@@ -225,6 +226,15 @@ async function checkSLTP(currentPrices) {
       }
     }
     else if (!onHold && price >= pos.tp) {
+      // O TP só fecha se o lucro líquido (após comissões) for positivo com margem.
+      // Em TPs largos (12%) isto passa sempre; em TPs apertados (scalper/ajuste
+      // baixo) evita "ganhar" no TP mas perder depois das taxas. NÃO afeta o SL.
+      const feeTP = broker.roundTripFee(pos.assetId, pos.amount);
+      const liqTP = (price - pos.entryPrice) * pos.units - feeTP;
+      if (liqTP < (pos.amount * 0.0010)) {
+        // ainda não cobre taxas + margem → não fecha, deixa o preço subir mais
+        continue;
+      }
       // ── TAKE-PROFIT PARCIAL (scale-out) — opcional, melhora retorno ────────
       // Em vez de "tudo ou nada" no TP, vende uma fração (default 50%) e deixa
       // o resto correr com o SL movido para break-even (entryPrice). Captura
@@ -311,6 +321,11 @@ async function checkSLTP(currentPrices) {
     await fb.saveBalance("server", simBalance);
     stats.addClosedTrade(closedTrade);
     dailyLossHit = stats.checkDailyLossLimit();
+
+    // Log colorido para localizar vendas facilmente nos logs do Railway.
+    const pct = pos.entryPrice ? ((closePrice - pos.entryPrice) / pos.entryPrice) * 100 : 0;
+    const linha = `💰 VENDA [${reason}] ${pos.assetSym} | P&L ${pnl >= 0 ? "+" : ""}€${pnl.toFixed(2)} (${pct >= 0 ? "+" : ""}${pct.toFixed(2)}%) | $${pos.entryPrice} → $${closePrice}`;
+    if (pnl >= 0) logger.win(linha); else logger.loss(linha);
 
     await notify(tg.tradeClose(closedTrade, pnl, reason, broker.getMode()));
   }
@@ -414,9 +429,14 @@ async function executeBuy(strategy, assetId, price, confianca) {
       const net = (cur - pos.entryPrice) * pos.units - fee;
       if (net > bestNet) { bestNet = net; bestWinner = pos; bestCur = cur; bestFee = fee; }
     }
-    // Só roda se a melhor posição der lucro LÍQUIDO (depois de comissões).
-    if (!bestWinner || bestNet <= 0) {
-      return; // nenhuma com lucro líquido para sacrificar
+    // Só roda se a melhor posição der um lucro LÍQUIDO MÍNIMO significativo.
+    // Antes rodava com qualquer lucro > 0 (até +€0.01), causando um ciclo de
+    // microtrading (abre/fecha/reabre sem parar = spam + comissões à toa).
+    // Agora exige pelo menos ROT_MIN_PCT% do valor investido (defeito 1%).
+    const rotMinPct = Number(appSettings.rotacaoMinPct ?? process.env.ROT_MIN_PCT ?? 1);
+    const minGanho = bestWinner ? (bestWinner.amount * rotMinPct / 100) : 0;
+    if (!bestWinner || bestNet < minGanho) {
+      return; // nenhuma posição com lucro suficiente para justificar a rotação
     }
     // Fechar o vencedor (P&L líquido de comissões)
     const cur = bestCur;
@@ -429,7 +449,7 @@ async function executeBuy(strategy, assetId, price, confianca) {
     await fb.updateTrade("server", bestWinner.id, { status: "ROTACAO", closePrice: cur, pnl: bestPnl, fee: bestFee, pnlBruto: bestBruto, closedAt: new Date().toLocaleString("pt-PT"), closedTs: rotClosedTs });
     await fb.saveBalance("server", simBalance);
     stats.addClosedTrade({ ...bestWinner, status: "ROTACAO", closePrice: cur, pnl: bestPnl, fee: bestFee, pnlBruto: bestBruto, closedTs: rotClosedTs });
-    logger.info(`🔄 ROTAÇÃO: fechado ${bestWinner.assetSym} (líq. +€${bestPnl.toFixed(2)}${bestFee>0?`, após €${bestFee.toFixed(2)} comissão`:""}) para abrir ${assetId}`);
+    logger.win(`🔄 ROTAÇÃO: fechado ${bestWinner.assetSym} (líq. +€${bestPnl.toFixed(2)}${bestFee>0?`, após €${bestFee.toFixed(2)} comissão`:""}) para abrir ${assetId}`);
   }
 
   const units = +(amount / price).toFixed(7);
@@ -504,7 +524,7 @@ async function executeBuy(strategy, assetId, price, confianca) {
   // Guarda no Firestore — a app React vê em tempo real
   await fb.saveTrade("server", position);
   await fb.saveBalance("server", simBalance);
-  await notify(tg.tradeOpen(position, broker.getMode()));
+  tg.queueOpen({ ...position, origemLabel: "🎯 Estratégias" }, broker.getMode());
 
   logger.info(`BUY ${broker.getMode().toUpperCase()} ${assetId} | €${amount} | @$${fillPrice} | SL $${sl} | TP $${tp}${position.brokerSLTP ? " (SL/TP na corretora)" : ""}`);
 }
@@ -519,6 +539,9 @@ function hasOpen(assetId, stratId) {
 // Abre uma posição de day trading (já com SL/TP decididos pela IA). Devolve true se abriu.
 async function openDayTrade({ assetId, assetName, assetSym, price, amount, sl, tp, previsao, confianca }) {
   if (dailyLossHit) return false;
+  // Anti-duplicado: se já há um day-trade aberto neste ativo, não abrir outro.
+  // (Evitava o spam de abrir o mesmo ativo a cada scan enquanto o sinal se mantém.)
+  if (Object.values(openPositions).some(p => p.assetId === assetId && p.stratId === "daytrading")) return false;
   // Valor e teto por origem (day-trade). Valor fixo da origem (se definido)
   // sobrepõe o sugerido pela IA; teto da origem senão o global.
   const poDt = (appSettings.perOrigem || {}).daytrading || {};
@@ -549,7 +572,7 @@ async function openDayTrade({ assetId, assetName, assetSym, price, amount, sl, t
 
   await fb.saveTrade("server", position);
   await fb.saveBalance("server", simBalance);
-  await notify(tg.tradeOpen(position, broker.getMode())).catch(() => {});
+  tg.queueOpen({ ...position, confianca, origemLabel: "⚡ Day Trading" }, broker.getMode());
   logger.info(`⚡ DAYTRADE BUY ${assetId} | €${amt} @$${price} | SL $${sl} | TP $${tp} | conf ${confianca}%`);
   return true;
 }
@@ -666,7 +689,7 @@ async function runAiBrain(currentPrices) {
 
     await fb.saveTrade("server", position);
     await fb.saveBalance("server", simBalance);
-    await notify(tg.tradeOpen(position, broker.getMode())).catch(() => {});
+    tg.queueOpen({ ...position, confianca: sg.confianca, origemLabel: viaTecnico ? "🧮 AI Técnico" : "🤖 AI Brain" }, broker.getMode());
     logger.info(`${viaTecnico ? "🧮 AI TÉCNICO" : "🤖 AI BRAIN"} BUY ${sg.id} | €${perTrade} @$${price} | confiança ${sg.confianca}%`);
   }
 }
@@ -1070,6 +1093,7 @@ async function init() {
       maxManuais:       val.maxManuais ?? 5,
       maxAiBrain:       val.maxAiBrain ?? 3,
       rotacaoAtiva:     val.rotacaoAtiva ?? false,
+      rotacaoMinPct:    val.rotacaoMinPct ?? 1,
       aiBrain:          val.aiBrain ?? false,
       aiBrainConfianca: val.aiBrainConfianca ?? 78,
       trailingStop:     val.trailingStop ?? false,
@@ -1208,7 +1232,8 @@ async function closePositionManual(posId, currentPrices) {
   await fb.saveBalance("server", simBalance);
   stats.addClosedTrade(closedTrade);
   await notify(tg.tradeClose(closedTrade, pnl, "MANUAL", broker.getMode()));
-  logger.info(`✋ VENDA MANUAL (pedido da app) ${pos.assetSym} | P&L ${sign(pnl)}${eur(pnl)}`);
+  const _linhaM = `✋ VENDA MANUAL (pedido da app) ${pos.assetSym} | P&L ${sign(pnl)}${eur(pnl)}`;
+  if (pnl >= 0) logger.win(_linhaM); else logger.loss(_linhaM);
   return { ok: true, pnl };
 }
 

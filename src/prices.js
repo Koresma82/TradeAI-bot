@@ -240,20 +240,26 @@ async function fetchFinnhub() {
   if (!FINNHUB_KEY) { const e = new Error("Finnhub sem API key (env FINNHUB_KEY)"); e.fhNoKey = true; throw e; }
   const now = Date.now();
   if (now - fhLastCall < FH_MIN_INTERVAL) return;        // respeita o ritmo
-  const wanted = ASSETS.filter(a => a.finnhub && isStale(a.id, 240000))
+  // Free tier do Finnhub: ações/ETF US em tempo real. Forex (OANDA:) e mercados
+  // internacionais exigem plano pago → por defeito NÃO os tentamos (devolvem c:0
+  // e gastam chamadas à toa). Ativa com FINNHUB_FOREX=1 se tiveres plano pago.
+  const allowForex = process.env.FINNHUB_FOREX === "1";
+  const wanted = ASSETS.filter(a => a.finnhub && isStale(a.id, 240000)
+      && (allowForex || !a.finnhub.startsWith("OANDA:")))
     .sort((x, y) => (priceCache[x.id]?.ts || 0) - (priceCache[y.id]?.ts || 0))
     .slice(0, FH_MAX_PER_CYCLE);
   if (!wanted.length) return;
   fhLastCall = now;
-  let ok = 0;
+  let ok = 0, tried = 0;
   for (const a of wanted) {
     try {
       const url = `https://finnhub.io/api/v1/quote?symbol=${encodeURIComponent(a.finnhub)}&token=${FINNHUB_KEY}`;
       const r = await fetchWithRetry(url, { headers: { Accept: "application/json" } });
       if (r.status === 429) throw new Error("Finnhub 429 (limite/min)");
+      tried++;
       if (!r.ok) continue;
       const q = await r.json();
-      // c=preço atual, dp=variação %. c=0 significa sem dados (símbolo não coberto no free).
+      // c=preço atual, dp=variação %. c=0 = símbolo sem dados no free tier.
       const price = parseFloat(q.c);
       if (!price || isNaN(price)) continue;
       const change = parseFloat(q.dp);
@@ -264,8 +270,8 @@ async function fetchFinnhub() {
       // outros erros por símbolo: ignora e continua
     }
   }
-  if (ok > 0) logger.info(`Finnhub: ${ok}/${wanted.length} preços ✓`);
-  else throw new Error("Finnhub devolveu 0 preços úteis (símbolos podem exigir plano pago)");
+  if (ok > 0) logger.info(`Finnhub: ${ok}/${tried} preços ✓ (ETF/ações US)`);
+  else if (tried > 0) throw new Error("Finnhub: símbolos US sem dados (mercado fechado?)");
 }
 
 // ── Yahoo Finance (ETF/commodity, último recurso) ───────────────────────────
