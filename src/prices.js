@@ -325,11 +325,28 @@ function getAll()          { return { ...priceCache }; }
 // ouro na app). Para trading, usamos getFreshPrice(): só devolve preço se vier
 // mesmo de um feed (não-seed) e estiver fresco; caso contrário devolve null e o
 // motor NÃO opera nesse ativo neste tick.
-function isReal(assetId, maxAgeMs = 120000) {
-  const c = priceCache[assetId];
-  return !!c && !c.seed && typeof c.price === "number" && c.price > 0 && (Date.now() - c.ts) <= maxAgeMs;
+// Janela de frescura por CATEGORIA. Crypto atualiza ao segundo → apertado.
+// Metais/ETF/forex movem-se devagar e as fontes (Stooq/TwelveData/Yahoo) são
+// mais lentas e falham mais → tolerância maior, senão recusam-se compras
+// legítimas a preços ainda válidos (foi o que bloqueou a compra de prata).
+// Isto NÃO enfraquece a proteção do crypto, que continua apertada.
+const FRESH_BY_CAT = {
+  Crypto:    120000,   // 2 min
+  Commodity: 600000,   // 10 min
+  ETF:       600000,   // 10 min
+  Forex:     600000,   // 10 min
+  "Ação":    600000,   // 10 min
+};
+function freshWindow(assetId) {
+  const a = ASSETS.find(x => x.id === assetId);
+  return (a && FRESH_BY_CAT[a.cat]) || 120000;
 }
-function getFreshPrice(assetId, maxAgeMs = 120000) {
+function isReal(assetId, maxAgeMs) {
+  const c = priceCache[assetId];
+  const win = typeof maxAgeMs === "number" ? maxAgeMs : freshWindow(assetId);
+  return !!c && !c.seed && typeof c.price === "number" && c.price > 0 && (Date.now() - c.ts) <= win;
+}
+function getFreshPrice(assetId, maxAgeMs) {
   return isReal(assetId, maxAgeMs) ? priceCache[assetId].price : null;
 }
 

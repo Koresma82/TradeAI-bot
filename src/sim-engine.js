@@ -39,6 +39,8 @@ const HEARTBEAT_MS     = 2 * 60 * 1000;   // heartbeat a cada 2 min (app exige <
 // Definições lidas do Firestore (a app controla isto)
 let appSettings   = {
   maxEstrategias: 5,
+  maxManuais: 5,           // limite de posições abertas por compras manuais
+  maxAiBrain: 3,           // limite SÓ para o Cérebro AI (separado das estratégias)
   riscoPerfil: "moderado",
   modoValor: "fixo",
   rotacaoAtiva: false,
@@ -66,6 +68,15 @@ let appSettings   = {
     ETF:       0.7,
     Forex:     0.4,
     Ação:      1.1,
+  },
+  // Valor (€) e teto (€) por trade SEPARADOS por origem. Cada origem pode ter o
+  // seu próprio valor fixo e teto; 0/null/ausente = herda o global (valorFixo /
+  // maxValorTrade). Isto permite, ex.: estratégias €50, AI €30, day-trade €20.
+  perOrigem: {
+    estrategias: { valorFixo: 0, maxValorTrade: 0 },
+    aibrain:     { valorFixo: 0, maxValorTrade: 0 },
+    daytrading:  { valorFixo: 0, maxValorTrade: 0 },
+    manual:      { valorFixo: 0, maxValorTrade: 0 },
   },
 };
 let dtConfig = null; // config de day trading lida da app (dtState)
@@ -307,18 +318,24 @@ async function checkSLTP(currentPrices) {
 // ── Sugestão de quantia a investir — perfil de risco + confiança + saldo ──────
 // Espelha a lógica da app. Em sim usa o saldo da simulação; em paper/live usaria
 // o saldo do broker (via broker.getBalance, mas mantemos simples e seguro aqui).
-function suggestAmount(assetId, confianca, strategy) {
+function suggestAmount(assetId, confianca, strategy, origem) {
   const avail = simBalance;
   if (!avail || avail <= 0) return strategy.perTrade || 10;
-  // Teto ABSOLUTO em € por trade (configurável na app). Impede que uma % do
-  // saldo de paper ($100k) gere posições gigantes — o problema dos €500/trade.
-  // 0, vazio ou indefinido = SEM teto (aplica só a %/valor fixo).
-  const tetoCfg = Number(appSettings.maxValorTrade);
+
+  // Valor e teto por ORIGEM (estrategias/aibrain/daytrading/manual). Se a origem
+  // não tiver valor próprio (0/null), herda o global. Permite afinar cada motor.
+  const po = (appSettings.perOrigem || {})[origem] || {};
+  const valOrigem = Number(po.valorFixo) > 0 ? Number(po.valorFixo) : null;
+  const tetoOrigem = Number(po.maxValorTrade) > 0 ? Number(po.maxValorTrade) : null;
+
+  // Teto ABSOLUTO em € por trade: origem (se definido) senão global. 0/vazio = sem teto.
+  const tetoCfg = tetoOrigem != null ? tetoOrigem : Number(appSettings.maxValorTrade);
   const tetoAbs = (Number.isFinite(tetoCfg) && tetoCfg > 0) ? tetoCfg : Infinity;
 
-  // Modo "fixo": respeita o valor fixo da estratégia/definições (comportamento clássico).
+  // Modo "fixo": valor da origem > valor da estratégia > valorFixo global.
   if (appSettings.modoValor !== "percentagem") {
-    return Math.min(strategy.perTrade || appSettings.valorFixo || 10, avail, tetoAbs);
+    const base = valOrigem != null ? valOrigem : (strategy.perTrade || appSettings.valorFixo || 10);
+    return Math.min(base, avail, tetoAbs);
   }
 
   // Modo "% da Banca": dimensiona pelo perfil de risco + confiança + saldo.
@@ -350,7 +367,10 @@ async function executeBuy(strategy, assetId, price, confianca) {
     return;
   }
   // Quantia: por perfil+confiança+saldo se modoInvestimento="auto", senão fixo.
-  const sized  = suggestAmount(assetId, confianca, strategy);
+  // Origem para sizing por-origem: manual vs estratégia (o AI-Brain chama
+  // suggestAmount diretamente com "aibrain"; o day-trade tem o seu próprio fluxo).
+  const origem = strategy.id === "manual" ? "manual" : "estrategias";
+  const sized  = suggestAmount(assetId, confianca, strategy, origem);
   // sized já vem com o teto aplicado por suggestAmount; aqui só reforçamos se
   // houver teto configurado (0/vazio = sem teto).
   const tetoCfg2 = Number(appSettings.maxValorTrade);
@@ -373,10 +393,11 @@ async function executeBuy(strategy, assetId, price, confianca) {
   }
   if (dailyLossHit) { logger.warn("Limite perda diária atingido — bloqueado"); return; }
 
-  // Limite de posições de estratégia (por tipo)
+  // Limite de posições de estratégia (só conta estratégias — AI-Brain, manual e
+  // day-trade têm os seus próprios limites e não roubam vagas às estratégias).
   const maxStrat = appSettings.maxEstrategias || 5;
   const stratPositions = Object.values(openPositions).filter(
-    p => p.stratId !== "manual" && p.stratId !== "daytrading"
+    p => p.stratId !== "manual" && p.stratId !== "daytrading" && p.stratId !== "ai-brain"
   );
   if (stratPositions.length >= maxStrat) {
     if (!appSettings.rotacaoAtiva) {
@@ -497,8 +518,13 @@ function hasOpen(assetId, stratId) {
 // Abre uma posição de day trading (já com SL/TP decididos pela IA). Devolve true se abriu.
 async function openDayTrade({ assetId, assetName, assetSym, price, amount, sl, tp, previsao, confianca }) {
   if (dailyLossHit) return false;
-  const tetoDt = Number(appSettings.maxValorTrade);
-  const amt = (Number.isFinite(tetoDt) && tetoDt > 0) ? Math.min(amount, tetoDt) : amount;
+  // Valor e teto por origem (day-trade). Valor fixo da origem (se definido)
+  // sobrepõe o sugerido pela IA; teto da origem senão o global.
+  const poDt = (appSettings.perOrigem || {}).daytrading || {};
+  const valDt = Number(poDt.valorFixo) > 0 ? Number(poDt.valorFixo) : null;
+  const tetoDtCfg = Number(poDt.maxValorTrade) > 0 ? Number(poDt.maxValorTrade) : Number(appSettings.maxValorTrade);
+  let amt = valDt != null ? valDt : amount;
+  if (Number.isFinite(tetoDtCfg) && tetoDtCfg > 0) amt = Math.min(amt, tetoDtCfg);
   if (simBalance < amt) return false;
   const maxTotDt = Number(appSettings.maxPosicoesTotal);
   if (Number.isFinite(maxTotDt) && maxTotDt > 0 && Object.keys(openPositions).length >= maxTotDt) {
@@ -601,13 +627,15 @@ async function runAiBrain(currentPrices) {
     if (Date.now() - (lastLossTime[sg.id] || 0) < aiLossCdMs) continue;
     // não duplicar posição AI no mesmo ativo
     if (Object.values(openPositions).some(p => p.assetId === sg.id && p.stratId === "ai-brain")) continue;
-    // limites
+    // limites — o Cérebro AI tem o SEU PRÓPRIO limite, separado das estratégias.
+    // Antes partilhavam maxEstrategias: as estratégias (que correm primeiro no
+    // tick) enchiam as vagas e o AI-Brain nunca abria. Agora conta só as suas.
     const brainPositions = Object.values(openPositions).filter(p => p.stratId === "ai-brain");
-    const allStratPos = Object.values(openPositions).filter(p => p.stratId !== "manual" && p.stratId !== "daytrading");
-    if (allStratPos.length >= maxStrat) continue;
+    const maxBrain = Number(appSettings.maxAiBrain) || 3;
+    if (brainPositions.length >= maxBrain) continue;
     // Quantia por perfil+confiança+saldo (igual à app); fixo se modo != auto.
     const perTrade = Math.min(
-      suggestAmount(sg.id, sg.confianca, { perTrade: appSettings.valorFixo || 100 }),
+      suggestAmount(sg.id, sg.confianca, { perTrade: appSettings.valorFixo || 100 }, "aibrain"),
       parseFloat(process.env.MAX_POSITION_EUR || "500")
     );
     if (simBalance < perTrade) continue;
@@ -1030,6 +1058,8 @@ async function init() {
     if (!val || typeof val !== "object") return;
     appSettings = {
       maxEstrategias:   val.maxEstrategias ?? 5,
+      maxManuais:       val.maxManuais ?? 5,
+      maxAiBrain:       val.maxAiBrain ?? 3,
       rotacaoAtiva:     val.rotacaoAtiva ?? false,
       aiBrain:          val.aiBrain ?? false,
       aiBrainConfianca: val.aiBrainConfianca ?? 78,
@@ -1049,6 +1079,7 @@ async function init() {
       scaleOutTP:       val.scaleOutTP ?? false,   // TP parcial (vende fração, deixa correr)
       scaleOutPct:      val.scaleOutPct ?? 50,     // % a vender no TP parcial
       catAjuste:        (val.catAjuste && typeof val.catAjuste === "object") ? val.catAjuste : appSettings.catAjuste,
+      perOrigem:        (val.perOrigem && typeof val.perOrigem === "object") ? val.perOrigem : appSettings.perOrigem,
     };
     aiSignals.setRefreshMinutes(appSettings.aiSignalsMin);
     logger.info(`Definições [${SETTINGS_DOC}]: máx ${appSettings.maxEstrategias} | rotação ${appSettings.rotacaoAtiva ? "ON" : "OFF"} | AI Brain ${appSettings.aiBrain ? `ON@${appSettings.aiBrainConfianca}%` : "OFF"} | Trailing ${appSettings.trailingStop ? `ON@${appSettings.trailingStopPct}%` : "OFF"} | teto €${appSettings.maxValorTrade} | Sinais ${appSettings.aiSignalsMin}min`);
@@ -1175,7 +1206,17 @@ async function closePositionManual(posId, currentPrices) {
 // ── Comprar a pedido do utilizador (via comando) ─────────────────────────────
 async function buyManual({ assetId, amount }) {
   const price = prices.getFreshPrice(assetId);
-  if (!price) return { ok: false, reason: "sem preço real fresco para este ativo" };
+  if (!price) {
+    const sym = (prices.ASSETS.find(a => a.id === assetId)?.sym) || assetId;
+    return { ok: false, reason: `sem preço de mercado atual para ${sym} (fonte de dados em baixo) — tenta novamente daqui a pouco` };
+  }
+  // Limite de posições MANUAIS imposto no bot (não só na app) — para o limite
+  // ser fiável mesmo que o comando venha de outra origem.
+  const maxMan = Number(appSettings.maxManuais) || 5;
+  const manualAbertas = Object.values(openPositions).filter(p => p.stratId === "manual").length;
+  if (manualAbertas >= maxMan) {
+    return { ok: false, reason: `limite de ${maxMan} posições manuais atingido` };
+  }
   // Reaproveita o caminho normal de compra, como uma "estratégia manual".
   const fakeStrat = { id: "manual", nome: "Compra manual", sl: appSettings.stopLossPadrao || 6, tp: appSettings.takeProfitPadrao || 12, compra: 0, risco: "manual", perTrade: amount };
   const before = Object.keys(openPositions).length;
