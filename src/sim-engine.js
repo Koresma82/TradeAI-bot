@@ -35,6 +35,7 @@ let lastFeaturesJson   = "";   // últimas features escritas no botStatus
 const SIMLIVE_MIN_MS   = 60 * 1000;       // no máx. 1 escrita de simLive por minuto
 const PRICES_PUB_MS    = 2 * 60 * 1000;   // publica preços p/ a app a cada 2 min
 let lastPricesAt       = 0;
+let lastPricesJson     = "";   // último marketPrices publicado (só reescreve se mudar)
 const HEARTBEAT_MS     = 2 * 60 * 1000;   // heartbeat a cada 2 min (app exige < 3 min)
 // Definições lidas do Firestore (a app controla isto)
 let appSettings   = {
@@ -840,7 +841,14 @@ async function tick() {
         const d = all[a.id];
         if (d?.price) slim[a.id] = { price: d.price, change: d.change ?? 0 };
       }
-      await fb.saveSetting("server", "marketPrices", { prices: slim, ts: now }).catch(() => {});
+      // Otimização Firestore: só publica se os preços MUDARAM desde a última
+      // publicação. Em mercado parado (noite/fim de semana) evita reescritas
+      // inúteis — poupa escritas no free tier sem afetar a app (lê o último valor).
+      const slimJson = JSON.stringify(slim);
+      if (slimJson !== lastPricesJson) {
+        await fb.saveSetting("server", "marketPrices", { prices: slim, ts: now }).catch(() => {});
+        lastPricesJson = slimJson;
+      }
       lastPricesAt = now;
     }
 
@@ -864,8 +872,9 @@ async function tick() {
         groq:       { ok: gh.ok, rateLimited: gh.rateLimited, untilMs: gh.untilMs },
         binance:    { ok: ph.binance?.ok,    lastOk: ph.binance?.lastOk,    err: ph.binance?.lastErr },
         coingecko:  { ok: ph.coingecko.ok,   lastOk: ph.coingecko.lastOk,   err: ph.coingecko.lastErr },
-        twelvedata: { ok: ph.twelvedata?.ok, lastOk: ph.twelvedata?.lastOk, err: ph.twelvedata?.lastErr },
-        stooq:      { ok: ph.stooq.ok,       lastOk: ph.stooq.lastOk,       err: ph.stooq.lastErr },
+        twelvedata: { ok: ph.twelvedata?.ok, lastOk: ph.twelvedata?.lastOk, err: ph.twelvedata?.lastErr, exhausted: !!ph.twelvedata?.exhausted },
+        finnhub:    { ok: ph.finnhub?.ok,    lastOk: ph.finnhub?.lastOk,    err: ph.finnhub?.lastErr, disabled: !!ph.finnhub?.disabled },
+        stooq:      { ok: ph.stooq.ok,       lastOk: ph.stooq.lastOk,       err: ph.stooq.lastErr, disabled: !!ph.stooq?.disabled },
       };
       await fb.saveSetting("server", "botStatus", {
         alive:    true,

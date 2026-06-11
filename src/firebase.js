@@ -146,9 +146,14 @@ async function getBalance(uid) {
 }
 
 // ── Actualizar saldo ──────────────────────────────────────────────────────────
+let _lastBalanceWritten = null;
 async function saveBalance(uid, value) {
   // Escreve na chave conforme o modo: simBalance (sim) ou liveBalance (paper/real).
-  // Assim a app mostra o saldo certo em cada vista sem os misturar.
+  // Otimização Firestore: só reescreve se o saldo MUDOU. Várias operações por tick
+  // chamam saveBalance com o mesmo valor — evitar isso poupa escritas (free tier).
+  const rounded = Math.round((Number(value) || 0) * 100) / 100;
+  if (_lastBalanceWritten === rounded) return;
+  _lastBalanceWritten = rounded;
   const mode = (process.env.MODE || "sim").toLowerCase();
   const key  = (mode === "paper" || mode === "real") ? "liveBalance" : "simBalance";
   await userDoc("settings", key).set({

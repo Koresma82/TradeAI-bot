@@ -7,6 +7,8 @@
 const logger = require("./logger");
 
 const TWELVE_KEY = process.env.TWELVEDATA_KEY || "";
+const STOOQ_KEY  = process.env.STOOQ_APIKEY || "";
+const FINNHUB_KEY = process.env.FINNHUB_KEY || "";
 // Domínio de dados da Binance (público, sem 451 em datacenters). Override via env.
 const BINANCE_DATA = process.env.BINANCE_DATA_URL || "https://data-api.binance.vision";
 let binanceBlocked = false; // se der 451, deixa de tentar nesta execução
@@ -24,23 +26,23 @@ const ASSETS = [
   { id:"dot",    sym:"DOT",     name:"Polkadot",      icon:"⬤",  cat:"Crypto",    cg:"polkadot",     stooq:null, binance:"DOTUSDT", td:null, yahoo:null },
   { id:"link",   sym:"LINK",    name:"Chainlink",     icon:"⬡",  cat:"Crypto",    cg:"chainlink",    stooq:null, binance:"LINKUSDT", td:null, yahoo:null },
   // ── Commodities (Stooq, horário de mercado) ──
-  { id:"wti",    sym:"WTI",     name:"Petróleo WTI",  icon:"🛢", cat:"Commodity", cg:null,           stooq:"cl.f", binance:null, td:"WTI/USD", yahoo:"CL=F" },
-  { id:"gold",   sym:"XAU",     name:"Ouro",          icon:"🥇", cat:"Commodity", cg:null,           stooq:"gc.f", binance:null, td:"XAU/USD", yahoo:"GC=F" },
-  { id:"silver", sym:"XAG",     name:"Prata",         icon:"🥈", cat:"Commodity", cg:null,           stooq:"si.f", binance:null, td:"XAG/USD", yahoo:"SI=F" },
+  { id:"wti",    sym:"WTI",     name:"Petróleo WTI",  icon:"🛢", cat:"Commodity", cg:null,           stooq:"cl.f", binance:null, td:"WTI/USD", finnhub:"OANDA:WTICO_USD", yahoo:"CL=F" },
+  { id:"gold",   sym:"XAU",     name:"Ouro",          icon:"🥇", cat:"Commodity", cg:null,           stooq:"gc.f", binance:null, td:"XAU/USD", finnhub:"OANDA:XAU_USD", yahoo:"GC=F" },
+  { id:"silver", sym:"XAG",     name:"Prata",         icon:"🥈", cat:"Commodity", cg:null,           stooq:"si.f", binance:null, td:"XAG/USD", finnhub:"OANDA:XAG_USD", yahoo:"SI=F" },
   // ── ETFs (Stooq, horário de mercado) ──
-  { id:"spy",    sym:"SPY",     name:"S&P 500 ETF",   icon:"📈", cat:"ETF",       cg:null,           stooq:"spy.us", binance:null, td:"SPY", yahoo:"SPY" },
-  { id:"qqq",    sym:"QQQ",     name:"Nasdaq ETF",    icon:"💻", cat:"ETF",       cg:null,           stooq:"qqq.us", binance:null, td:"QQQ", yahoo:"QQQ" },
-  { id:"gld",    sym:"GLD",     name:"Gold ETF",      icon:"🏅", cat:"ETF",       cg:null,           stooq:"gld.us", binance:null, td:"GLD", yahoo:"GLD" },
-  { id:"iwm",    sym:"IWM",     name:"Russell 2000",  icon:"📊", cat:"ETF",       cg:null,           stooq:"iwm.us", binance:null, td:"IWM", yahoo:"IWM" },
-  { id:"tlt",    sym:"TLT",     name:"US Bonds ETF",  icon:"📋", cat:"ETF",       cg:null,           stooq:"tlt.us", binance:null, td:"TLT", yahoo:"TLT" },
-  { id:"xle",    sym:"XLE",     name:"Energy ETF",    icon:"⚡", cat:"ETF",       cg:null,           stooq:"xle.us", binance:null, td:"XLE", yahoo:"XLE" },
+  { id:"spy",    sym:"SPY",     name:"S&P 500 ETF",   icon:"📈", cat:"ETF",       cg:null,           stooq:"spy.us", binance:null, td:"SPY", finnhub:"SPY", yahoo:"SPY" },
+  { id:"qqq",    sym:"QQQ",     name:"Nasdaq ETF",    icon:"💻", cat:"ETF",       cg:null,           stooq:"qqq.us", binance:null, td:"QQQ", finnhub:"QQQ", yahoo:"QQQ" },
+  { id:"gld",    sym:"GLD",     name:"Gold ETF",      icon:"🏅", cat:"ETF",       cg:null,           stooq:"gld.us", binance:null, td:"GLD", finnhub:"GLD", yahoo:"GLD" },
+  { id:"iwm",    sym:"IWM",     name:"Russell 2000",  icon:"📊", cat:"ETF",       cg:null,           stooq:"iwm.us", binance:null, td:"IWM", finnhub:"IWM", yahoo:"IWM" },
+  { id:"tlt",    sym:"TLT",     name:"US Bonds ETF",  icon:"📋", cat:"ETF",       cg:null,           stooq:"tlt.us", binance:null, td:"TLT", finnhub:"TLT", yahoo:"TLT" },
+  { id:"xle",    sym:"XLE",     name:"Energy ETF",    icon:"⚡", cat:"ETF",       cg:null,           stooq:"xle.us", binance:null, td:"XLE", finnhub:"XLE", yahoo:"XLE" },
   // ── Forex (Stooq, dias úteis) ──
-  { id:"eurusd", sym:"EUR/USD", name:"EUR/USD",       icon:"💶", cat:"Forex",     cg:null,           stooq:"eurusd", binance:null, td:"EUR/USD", yahoo:"EURUSD=X" },
-  { id:"gbpusd", sym:"GBP/USD", name:"GBP/USD",       icon:"💷", cat:"Forex",     cg:null,           stooq:"gbpusd", binance:null, td:"GBP/USD", yahoo:"GBPUSD=X" },
-  { id:"usdjpy", sym:"USD/JPY", name:"USD/JPY",       icon:"¥",  cat:"Forex",     cg:null,           stooq:"usdjpy", binance:null, td:"USD/JPY", yahoo:"USDJPY=X" },
-  { id:"usdchf", sym:"USD/CHF", name:"USD/CHF",       icon:"🇨🇭", cat:"Forex",    cg:null,           stooq:"usdchf", binance:null, td:"USD/CHF", yahoo:"USDCHF=X" },
-  { id:"audusd", sym:"AUD/USD", name:"AUD/USD",       icon:"🇦🇺", cat:"Forex",    cg:null,           stooq:"audusd", binance:null, td:"AUD/USD", yahoo:"AUDUSD=X" },
-  { id:"usdcad", sym:"USD/CAD", name:"USD/CAD",       icon:"🇨🇦", cat:"Forex",    cg:null,           stooq:"usdcad", binance:null, td:"USD/CAD", yahoo:"USDCAD=X" },
+  { id:"eurusd", sym:"EUR/USD", name:"EUR/USD",       icon:"💶", cat:"Forex",     cg:null,           stooq:"eurusd", binance:null, td:"EUR/USD", finnhub:"OANDA:EUR_USD", yahoo:"EURUSD=X" },
+  { id:"gbpusd", sym:"GBP/USD", name:"GBP/USD",       icon:"💷", cat:"Forex",     cg:null,           stooq:"gbpusd", binance:null, td:"GBP/USD", finnhub:"OANDA:GBP_USD", yahoo:"GBPUSD=X" },
+  { id:"usdjpy", sym:"USD/JPY", name:"USD/JPY",       icon:"¥",  cat:"Forex",     cg:null,           stooq:"usdjpy", binance:null, td:"USD/JPY", finnhub:"OANDA:USD_JPY", yahoo:"USDJPY=X" },
+  { id:"usdchf", sym:"USD/CHF", name:"USD/CHF",       icon:"🇨🇭", cat:"Forex",    cg:null,           stooq:"usdchf", binance:null, td:"USD/CHF", finnhub:"OANDA:USD_CHF", yahoo:"USDCHF=X" },
+  { id:"audusd", sym:"AUD/USD", name:"AUD/USD",       icon:"🇦🇺", cat:"Forex",    cg:null,           stooq:"audusd", binance:null, td:"AUD/USD", finnhub:"OANDA:AUD_USD", yahoo:"AUDUSD=X" },
+  { id:"usdcad", sym:"USD/CAD", name:"USD/CAD",       icon:"🇨🇦", cat:"Forex",    cg:null,           stooq:"usdcad", binance:null, td:"USD/CAD", finnhub:"OANDA:USD_CAD", yahoo:"USDCAD=X" },
 ];
 
 const BASE_PRICES = {
@@ -56,11 +58,12 @@ let initialized = false;
 
 // ── Saúde das fontes de preço (para o health check na app) ──────────────────
 const sourceHealth = {
-  binance:    { ok: null, lastOk: 0, lastErr: null },
-  coingecko:  { ok: null, lastOk: 0, lastErr: null },
-  twelvedata: { ok: null, lastOk: 0, lastErr: null },
-  stooq:      { ok: null, lastOk: 0, lastErr: null },
-  yahoo:      { ok: null, lastOk: 0, lastErr: null },
+  binance:    { ok: null, lastOk: 0, lastErr: null, disabled: false, exhausted: false },
+  coingecko:  { ok: null, lastOk: 0, lastErr: null, disabled: false, exhausted: false },
+  twelvedata: { ok: null, lastOk: 0, lastErr: null, disabled: false, exhausted: false },
+  finnhub:    { ok: null, lastOk: 0, lastErr: null, disabled: false, exhausted: false },
+  stooq:      { ok: null, lastOk: 0, lastErr: null, disabled: false, exhausted: false },
+  yahoo:      { ok: null, lastOk: 0, lastErr: null, disabled: false, exhausted: false },
 };
 function getSourceHealth() { return sourceHealth; }
 
@@ -192,8 +195,12 @@ async function fetchTwelveData() {
   const now = Date.now();
   if (now - tdLastCall < TD_MIN_INTERVAL) return;
   if (tdCreditsToday >= TD_DAILY_BUDGET) {
-    if (tdCreditsToday === TD_DAILY_BUDGET) logger.warn(`TwelveData: orçamento diário (${TD_DAILY_BUDGET}) atingido — Stooq assume até amanhã`);
-    return;
+    if (tdCreditsToday === TD_DAILY_BUDGET) logger.warn(`TwelveData: orçamento diário (${TD_DAILY_BUDGET}) atingido — backup assume até amanhã`);
+    // Marca esgotado para a app NÃO mostrar "OK" enganador. Lança erro suave
+    // para o track refletir o estado real (limite atingido).
+    const e = new Error(`orçamento diário esgotado (${TD_DAILY_BUDGET} créditos)`);
+    e.tdExhausted = true;
+    throw e;
   }
   // Só ativos stale há >4min (mexem devagar), no máx TD_MAX_SYMBOLS, mais antigos 1º.
   const wanted = ASSETS.filter(a => a.td && isStale(a.id, 240000))
@@ -222,6 +229,45 @@ async function fetchTwelveData() {
   else if (wanted.length) throw new Error("TwelveData devolveu 0 preços úteis");
 }
 
+// ── Finnhub (forex/ETF/ação) — quote por símbolo ────────────────────────────
+// Free tier: ações/ETF US em tempo real, 60 chamadas/min. O endpoint /quote é
+// 1 símbolo por chamada → buscamos só os stale, com teto por ciclo, mais antigos
+// primeiro. Forex usa formato OANDA:XXX_YYY.
+let fhLastCall = 0;
+const FH_MIN_INTERVAL = 60000;            // no máx 1 lote por minuto
+const FH_MAX_PER_CYCLE = parseInt(process.env.FINNHUB_MAX_PER_CYCLE || "8"); // ≤8 símbolos/ciclo (folga no 60/min)
+async function fetchFinnhub() {
+  if (!FINNHUB_KEY) { const e = new Error("Finnhub sem API key (env FINNHUB_KEY)"); e.fhNoKey = true; throw e; }
+  const now = Date.now();
+  if (now - fhLastCall < FH_MIN_INTERVAL) return;        // respeita o ritmo
+  const wanted = ASSETS.filter(a => a.finnhub && isStale(a.id, 240000))
+    .sort((x, y) => (priceCache[x.id]?.ts || 0) - (priceCache[y.id]?.ts || 0))
+    .slice(0, FH_MAX_PER_CYCLE);
+  if (!wanted.length) return;
+  fhLastCall = now;
+  let ok = 0;
+  for (const a of wanted) {
+    try {
+      const url = `https://finnhub.io/api/v1/quote?symbol=${encodeURIComponent(a.finnhub)}&token=${FINNHUB_KEY}`;
+      const r = await fetchWithRetry(url, { headers: { Accept: "application/json" } });
+      if (r.status === 429) throw new Error("Finnhub 429 (limite/min)");
+      if (!r.ok) continue;
+      const q = await r.json();
+      // c=preço atual, dp=variação %. c=0 significa sem dados (símbolo não coberto no free).
+      const price = parseFloat(q.c);
+      if (!price || isNaN(price)) continue;
+      const change = parseFloat(q.dp);
+      setPrice(a, price, isNaN(change) ? null : change);
+      ok++;
+    } catch (e) {
+      if (String(e.message).includes("429")) { throw e; } // propaga rate-limit
+      // outros erros por símbolo: ignora e continua
+    }
+  }
+  if (ok > 0) logger.info(`Finnhub: ${ok}/${wanted.length} preços ✓`);
+  else throw new Error("Finnhub devolveu 0 preços úteis (símbolos podem exigir plano pago)");
+}
+
 // ── Yahoo Finance (ETF/commodity, último recurso) ───────────────────────────
 async function fetchYahoo() {
   const wanted = ASSETS.filter(a => a.yahoo && a.cat !== "Forex" && isStale(a.id));
@@ -246,15 +292,28 @@ async function fetchYahoo() {
 // ── Stooq (commodities/ETFs/forex) — CSV, funciona em datacenters ──────────
 // Formato CSV: Symbol,Date,Time,Open,High,Low,Close,Volume
 async function fetchStooq() {
+  // Desde março de 2026 o Stooq exige API key para downloads CSV. Sem chave,
+  // devolve uma página HTML de instruções (não CSV) → tratamos como indisponível.
+  if (!STOOQ_KEY) {
+    const e = new Error("Stooq requer API key (env STOOQ_APIKEY) — fonte desativada");
+    e.stooqNoKey = true;
+    throw e;
+  }
   const stooqAssets = ASSETS.filter(a => a.stooq && isStale(a.id));
   if (!stooqAssets.length) return;
   const symbols     = stooqAssets.map(a => a.stooq).join(",");
   // Stooq aceita múltiplos símbolos: https://stooq.com/q/l/?s=SYM1,SYM2&f=sd2t2ohlcv&h&e=csv
-  const url = `https://stooq.com/q/l/?s=${symbols}&f=sd2t2ohlcv&h&e=csv`;
+  const url = `https://stooq.com/q/l/?s=${symbols}&f=sd2t2ohlcv&h&e=csv&apikey=${encodeURIComponent(STOOQ_KEY)}`;
   const r   = await fetchWithRetry(url, { headers: { "User-Agent": "Mozilla/5.0" } });
   if (!r.ok) throw new Error(`Stooq ${r.status}`);
   const csv   = await r.text();
+  // Se vier HTML (página de instruções/erro de chave) em vez de CSV, é falha.
+  const head = csv.slice(0, 200).toLowerCase();
+  if (head.includes("<!doctype") || head.includes("<html") || head.includes("apikey")) {
+    throw new Error("Stooq devolveu HTML (API key inválida ou em falta)");
+  }
   const lines = csv.trim().split("\n");
+  let ok = 0;
   // Primeira linha é cabeçalho
   for (let i = 1; i < lines.length; i++) {
     const cols   = lines[i].split(",");
@@ -271,8 +330,10 @@ async function fetchStooq() {
       change: +change.toFixed(3),
       ts:     Date.now(),
     };
+    ok++;
   }
-  logger.info(`Stooq: ${stooqAssets.length} preços ✓`);
+  if (ok > 0) logger.info(`Stooq: ${ok}/${stooqAssets.length} preços ✓`);
+  else throw new Error("Stooq devolveu 0 preços úteis");
 }
 
 // ── Refresh all ─────────────────────────────────────────────────────────────
@@ -290,9 +351,21 @@ async function refreshAll() {
   const track = (name, res) => {
     const src = sourceHealth[name]; if (!src) return;
     if (res.status === "rejected") {
-      src.ok = false; src.lastErr = res.reason?.message || String(res.reason);
+      // TwelveData com orçamento diário esgotado → estado "limite", não falha de rede.
+      if (res.reason?.tdExhausted) {
+        src.ok = false; src.exhausted = true; src.disabled = false; src.lastErr = res.reason.message;
+        if (!src._warnedExhausted) { logger.warn(`TwelveData: ${res.reason.message} — repõe amanhã`); src._warnedExhausted = true; }
+        return;
+      }
+      // Finnhub ou Stooq sem API key → "desativado", não falha. Loga 1x.
+      if (res.reason?.stooqNoKey || res.reason?.fhNoKey) {
+        src.ok = false; src.disabled = true; src.lastErr = "sem API key";
+        if (!src._warnedNoKey) { logger.warn(`${name} desativado: define a API key para o reativar`); src._warnedNoKey = true; }
+        return;
+      }
+      src.ok = false; src.disabled = false; src.lastErr = res.reason?.message || String(res.reason);
       logger.warn(`Price feed ${name} falhou: ${src.lastErr} (a usar próxima fonte/cache)`);
-    } else { src.ok = true; src.lastOk = Date.now(); src.lastErr = null; }
+    } else { src.ok = true; src.disabled = false; src.exhausted = false; src.lastOk = Date.now(); src.lastErr = null; src._warnedExhausted = false; }
   };
 
   // 1) Crypto: Binance primeiro, CoinGecko cobre buracos.
@@ -302,7 +375,10 @@ async function refreshAll() {
   // 2) Forex/ETF/Commodity: TwelveData primeiro (se houver chave).
   track("twelvedata", (await Promise.allSettled([fetchTwelveData()]))[0]);
 
-  // 3) Fallbacks para o que ainda estiver stale: Stooq e Yahoo.
+  // 3) Finnhub (forex/ETF/ação) — backup principal dos não-crypto. Free 60/min.
+  track("finnhub", (await Promise.allSettled([fetchFinnhub()]))[0]);
+
+  // 4) Fallbacks para o que ainda estiver stale: Stooq e Yahoo.
   const [stooqRes, yahooRes] = await Promise.allSettled([fetchStooq(), fetchYahoo()]);
   track("stooq", stooqRes);
   track("yahoo", yahooRes);
