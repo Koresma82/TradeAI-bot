@@ -708,6 +708,11 @@ async function runAiBrain(currentPrices) {
 async function tick() {
   try {
     tickCount++;
+    // Rollover robusto: arquiva o dia anterior assim que o dia muda, mesmo que
+    // o cron da meia-noite tenha falhado (bot em baixo nesse minuto). Barato.
+    fb.checkDayRollover().then(r => {
+      if (r && r.length) notify(`📁 *Arquivo automático*: ${r.length} dia(s) arquivado(s).`).catch(() => {});
+    }).catch(() => {});
     // 1. Refresh preços
     await prices.refreshAll();
     const currentPrices = prices.getAll();
@@ -1069,6 +1074,21 @@ async function init() {
         // Sincronizar o flag 'hold' quando o utilizador o liga/desliga na app
         openPositions[p.id].hold = p.hold;
         logger.info(`${p.hold ? "🔒 HOLD ligado" : "🔓 HOLD desligado"}: ${p.assetSym || p.assetId}`);
+        // Coerência do Hold: se a posição tem bracket nativo (ação/ETF) e o
+        // utilizador LIGOU o Hold, a Alpaca fecharia na mesma quando o SL/TP
+        // batesse (o Hold seria ignorado). Para o Hold ser coerente em todos os
+        // ativos, cancelamos o bracket na corretora e passamos a gerir o SL/TP
+        // pelo motor (que respeita o Hold: bloqueia TP/AI-EXIT, mantém o SL).
+        if (p.hold === true && openPositions[p.id].brokerSLTP === true) {
+          broker.cancelBracket(openPositions[p.id].assetId, openPositions[p.id].broker)
+            .then(r => {
+              if (r && r.ok && !r.nada) {
+                openPositions[p.id].brokerSLTP = false; // motor assume o SL/TP
+                logEvent("warn", `Hold em ${p.assetSym || p.assetId}: bracket cancelado na corretora, SL/TP agora geridos pelo bot`);
+              }
+            })
+            .catch(() => {});
+        }
       }
     });
     // Remover do estado as posições que já não estão abertas no Firestore

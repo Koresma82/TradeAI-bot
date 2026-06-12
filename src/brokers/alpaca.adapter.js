@@ -156,4 +156,20 @@ module.exports = {
       return { ok: false, reason: err.message };
     }
   },
+
+  // Cancela as ordens-filhas de bracket (SL/TP nativo) de um ativo, sem fechar a
+  // posição. Usado quando o utilizador liga Hold: o bot passa a gerir o SL/TP.
+  // Crypto não tem bracket → nada a cancelar.
+  async cancelBracket(assetId) {
+    if (isCrypto(assetId)) return { ok: true, nada: true };
+    const symbol = orderSymbol(assetId);
+    try {
+      await alpaca.cancelOpenOrders(symbol);
+      logger.info(`[Alpaca] bracket cancelado para ${symbol} (Hold → gestão pelo motor)`);
+      return { ok: true };
+    } catch (err) {
+      logger.warn(`[Alpaca] cancelBracket(${symbol}) falhou: ${err.message}`);
+      return { ok: false, reason: err.message };
+    }
+  },
 };

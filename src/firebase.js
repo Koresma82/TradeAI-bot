@@ -400,9 +400,46 @@ async function catchUpArchives() {
   }
 }
 
+// ── Rollover robusto por tick ────────────────────────────────────────────────
+// Em vez de depender só do cron da meia-noite (que falha se o bot estiver em
+// baixo nesse minuto), verificamos a cada tick se o dia mudou. O último dia
+// processado é guardado no Firestore (sobrevive a reinícios). Quando o dia muda,
+// arquiva todos os dias em falta entre o último processado e ontem. Barato:
+// normalmente só lê 1 doc e compara strings; só arquiva quando o dia vira.
+let _rolloverMemoDay = "";
+async function checkDayRollover() {
+  try {
+    const hoje = lisbonDayString();
+    // Cache em memória: na esmagadora maioria dos ticks o dia não mudou.
+    if (_rolloverMemoDay === hoje) return null;
+
+    const ref = userDoc("settings", "lastProcessedDay");
+    const snap = await ref.get();
+    const ultimo = snap.exists ? snap.data().value : null;
+
+    if (ultimo === hoje) { _rolloverMemoDay = hoje; return null; }
+
+    // O dia mudou (ou primeiro arranque). Arquiva os dias em falta até ontem.
+    const recuperados = await catchUpArchives();
+
+    // Marca hoje como processado para não repetir.
+    await ref.set({ value: hoje, updatedAt: admin.firestore.FieldValue.serverTimestamp() });
+    _rolloverMemoDay = hoje;
+
+    if (recuperados && recuperados.length) {
+      logger.info(`🌙 Rollover de dia: arquivados ${recuperados.length} dia(s)`);
+    }
+    return recuperados;
+  } catch (err) {
+    logger.error(`Rollover de dia falhou: ${err.message}`);
+    return null;
+  }
+}
+
 module.exports = {
   initFirebase,
   appendLog,
+  checkDayRollover,
   watchStrategies,
   saveTrade,
   loadOpenPositions,

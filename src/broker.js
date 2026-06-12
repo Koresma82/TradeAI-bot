@@ -205,6 +205,17 @@ async function sell({ assetId, units, price, broker: preferred, hadBracket }) {
   return { ...res, broker: a.id };
 }
 
+// Cancela ordens de bracket (SL/TP nativo) pendentes de um ativo na corretora.
+// Usado quando o utilizador liga Hold numa posição com bracket: o bot passa a
+// gerir o SL/TP ele próprio, em vez de a corretora os disparar.
+async function cancelBracket(assetId, preferred) {
+  if (!LIVE) return { ok: true, simulated: true };
+  let a = preferred ? registry.byId(preferred) : null;
+  if (!a || !a.isConnected() || !a.supports(assetId)) a = pickAdapter(assetId);
+  if (!a || typeof a.cancelBracket !== "function") return { ok: false, reason: "adapter não suporta cancelBracket" };
+  return a.cancelBracket(assetId);
+}
+
 // Diagnóstico: que broker trataria cada ativo (útil em logs/arranque).
 function explainRouting(assetIds = []) {
   return assetIds.map(id => {
@@ -218,7 +229,7 @@ function isCrypto(assetId) { return CRYPTO_IDS.has(assetId); }
 
 module.exports = {
   getMode, isLive, isReal, verifyConnection, getBalance, getPositions,
-  buy, sell, isCrypto, assetClass, pickAdapter, explainRouting,
+  buy, sell, cancelBracket, isCrypto, assetClass, pickAdapter, explainRouting,
   estimateFee, roundTripFee, feeRate,
   registry,
 };
