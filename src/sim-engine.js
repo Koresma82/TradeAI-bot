@@ -566,13 +566,38 @@ async function openDayTrade({ assetId, assetName, assetSym, price, amount, sl, t
   if (totalInvested + amt > parseFloat(process.env.MAX_TOTAL_EUR || simCapital)) return false;
 
   const units = +(amt / price).toFixed(7);
-  const posId = `daytrade_${Date.now()}_${assetId}`;
+  const posId = `${broker.isLive() ? "live" : "sim"}_dt_${Date.now()}_${assetId}`;
+
+  // Em LIVE, pré-registo PENDING antes da ordem (atomicidade — rasto recuperável).
+  if (broker.isLive()) {
+    await fb.saveTrade("server", {
+      id: posId, assetId, assetName, assetSym,
+      entryPrice: price, units, amount: amt, sl, tp,
+      strategy: `⚡ DayTrade${confianca ? ` (${confianca}%)` : ""}`, stratId: "daytrading",
+      openedAt: new Date().toLocaleString("pt-PT"), openedTs: Date.now(),
+      status: "PENDING", mode: "live",
+    }).catch(e => logger.warn(`Pré-registo PENDING (day-trade) falhou: ${e.message}`));
+  }
+
+  // Executar a ordem (real na Alpaca se paper/real; simulada em sim).
+  const exec = await broker.buy({ assetId, amount: amt, price, sl, tp });
+  if (!exec.ok) {
+    logger.warn(`Day-trade ${assetSym} não executado: ${exec.reason}`);
+    if (broker.isLive()) await fb.updateTrade("server", posId, { status: "CANCELADA", closedTs: Date.now() }).catch(() => {});
+    return false;
+  }
+  const fillPrice = exec.fillPrice || price;
+  const realUnits = (typeof exec.filledQty === "number" && exec.filledQty > 0) ? exec.filledQty : units;
+
   const position = {
     id: posId, assetId, assetName, assetSym,
-    entryPrice: price, units, amount: amt, peak: price, sl, tp,
+    entryPrice: fillPrice, units: realUnits, amount: amt, peak: fillPrice, sl, tp,
     strategy: `⚡ DayTrade${confianca ? ` (${confianca}%)` : ""}${previsao ? ` — ${String(previsao).slice(0,40)}` : ""}`,
     stratId: "daytrading",
-    openedAt: new Date().toLocaleString("pt-PT"), openedTs: Date.now(), status: "ABERTA", mode: "sim",
+    openedAt: new Date().toLocaleString("pt-PT"), openedTs: Date.now(), status: "ABERTA",
+    mode: broker.isLive() ? "live" : "sim",
+    brokerOrderId: exec.brokerOrderId || null, broker: exec.broker || null,
+    brokerSLTP: !!exec.bracket, pendingFill: !!exec.pending,
   };
   openPositions[posId] = position;
   totalInvested += amt;
@@ -581,7 +606,7 @@ async function openDayTrade({ assetId, assetName, assetSym, price, amount, sl, t
   await fb.saveTrade("server", position);
   await fb.saveBalance("server", simBalance);
   queueOpen({ ...position, confianca, origemLabel: "⚡ Day Trading" }, broker.getMode());
-  const _mDt = `⚡ DAYTRADE ${assetId.toUpperCase()} | €${amt} @$${price} | conf ${confianca}%`;
+  const _mDt = `⚡ DAYTRADE ${assetId.toUpperCase()} | €${amt} @$${fillPrice} | conf ${confianca}%`;
   logger.buy(_mDt); logEvent("buy", _mDt);
   return true;
 }
@@ -679,17 +704,42 @@ async function runAiBrain(currentPrices) {
     const adjB  = adjustedRisk(sg.id, slPct, tpPct, null);
     const sl    = +(price * (1 - adjB.sl / 100)).toFixed(sg.id === "eurusd" ? 5 : 4);
     const tp    = +(price * (1 + adjB.tp / 100)).toFixed(sg.id === "eurusd" ? 5 : 4);
-    const posId = `aibrain_${Date.now()}_${sg.id}`;
+    const posId = `${broker.isLive() ? "live" : "sim"}_ai_${Date.now()}_${sg.id}`;
     // Distinguir a origem do sinal: Groq (LLM) vs fallback técnico (indicadores).
-    // Útil para perceberes no histórico o que cada modo está a fazer.
     const viaTecnico = !!sg._fallback;
+
+    // Em LIVE, pré-registo PENDING antes da ordem (atomicidade).
+    if (broker.isLive()) {
+      await fb.saveTrade("server", {
+        id: posId, assetId: sg.id, assetName: sg.id, assetSym: sg.id.toUpperCase(),
+        entryPrice: price, units, amount: perTrade, sl, tp,
+        strategy: viaTecnico ? `🧮 AI Técnico (${sg.confianca}%)` : `🤖 AI Brain (${sg.confianca}%)`,
+        stratId: "ai-brain", aiSource: viaTecnico ? "tecnico" : "groq",
+        openedAt: new Date().toLocaleString("pt-PT"), openedTs: Date.now(),
+        status: "PENDING", mode: "live",
+      }).catch(e => logger.warn(`Pré-registo PENDING (AI) falhou: ${e.message}`));
+    }
+
+    // Executar a ordem (real na Alpaca se paper/real; simulada em sim).
+    const exec = await broker.buy({ assetId: sg.id, amount: perTrade, price, sl, tp });
+    if (!exec.ok) {
+      logger.warn(`AI-Brain ${sg.id} não executado: ${exec.reason}`);
+      if (broker.isLive()) await fb.updateTrade("server", posId, { status: "CANCELADA", closedTs: Date.now() }).catch(() => {});
+      continue;
+    }
+    const fillPrice = exec.fillPrice || price;
+    const realUnits = (typeof exec.filledQty === "number" && exec.filledQty > 0) ? exec.filledQty : units;
+
     const position = {
       id: posId, assetId: sg.id, assetName: sg.id, assetSym: sg.id.toUpperCase(),
-      entryPrice: price, units, amount: perTrade, peak: price, sl, tp,
+      entryPrice: fillPrice, units: realUnits, amount: perTrade, peak: fillPrice, sl, tp,
       strategy: viaTecnico ? `🧮 AI Técnico (${sg.confianca}%)` : `🤖 AI Brain (${sg.confianca}%)`,
       stratId: "ai-brain",
-      aiSource: viaTecnico ? "tecnico" : "groq", // origem do sinal (para a app filtrar/etiquetar)
-      openedAt: new Date().toLocaleString("pt-PT"), openedTs: Date.now(), status: "ABERTA", mode: "sim",
+      aiSource: viaTecnico ? "tecnico" : "groq",
+      openedAt: new Date().toLocaleString("pt-PT"), openedTs: Date.now(), status: "ABERTA",
+      mode: broker.isLive() ? "live" : "sim",
+      brokerOrderId: exec.brokerOrderId || null, broker: exec.broker || null,
+      brokerSLTP: !!exec.bracket, pendingFill: !!exec.pending,
     };
     openPositions[posId] = position;
     totalInvested += perTrade;
@@ -699,7 +749,7 @@ async function runAiBrain(currentPrices) {
     await fb.saveTrade("server", position);
     await fb.saveBalance("server", simBalance);
     queueOpen({ ...position, confianca: sg.confianca, origemLabel: viaTecnico ? "🧮 AI Técnico" : "🤖 AI Brain" }, broker.getMode());
-    const _mAi = `${viaTecnico ? "🧮 AI TÉCNICO" : "🤖 AI BRAIN"} ${sg.id.toUpperCase()} | €${perTrade} @$${price} | ${sg.confianca}%`;
+    const _mAi = `${viaTecnico ? "🧮 AI TÉCNICO" : "🤖 AI BRAIN"} ${sg.id.toUpperCase()} | €${perTrade} @$${fillPrice} | ${sg.confianca}%`;
     logger.buy(_mAi); logEvent("buy", _mAi);
   }
 }
