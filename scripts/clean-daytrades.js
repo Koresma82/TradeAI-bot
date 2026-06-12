@@ -24,23 +24,18 @@
  * Usa as mesmas credenciais do bot (FIREBASE_ADMIN_JSON / USER_UID).
  */
 const admin = require("firebase-admin");
+const fb = require("../src/firebase");
 
 const EXECUTAR = process.argv.includes("--executar");
 
 function fail(msg) { console.error(`❌ ${msg}`); process.exit(1); }
 
-function initFirebase() {
-  if (admin.apps.length) return;
-  const json = process.env.FIREBASE_ADMIN_JSON;
-  if (json) admin.initializeApp({ credential: admin.cert(JSON.parse(json)) });
-  else admin.initializeApp({ credential: admin.cert(require("../config/firebase-admin.json")) });
-}
-
 async function main() {
   const USER_UID = process.env.USER_UID;
   if (!USER_UID) fail("USER_UID não definido no ambiente.");
 
-  initFirebase();
+  // Reutiliza a inicialização do próprio bot (já testada, lida com FIREBASE_ADMIN_JSON).
+  fb.initFirebase();
   const db = admin.firestore();
   const dtRef = db.collection("users").doc(USER_UID).collection("settings").doc("dtState");
 

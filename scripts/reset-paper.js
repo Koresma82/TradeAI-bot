@@ -61,10 +61,8 @@ async function alpaca(path, options = {}) {
 }
 
 const admin = require("firebase-admin");
-let serviceAccount;
-try { serviceAccount = JSON.parse(process.env.FIREBASE_ADMIN_JSON); }
-catch { fail("FIREBASE_ADMIN_JSON inválido."); }
-admin.initializeApp({ credential: admin.credential.cert(serviceAccount) });
+const fb = require("../src/firebase");
+fb.initFirebase();
 const db = admin.firestore();
 const userCol = (col) => db.collection("users").doc(USER_UID).collection(col);
 
