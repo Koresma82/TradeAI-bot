@@ -123,6 +123,23 @@ async function main() {
     console.log(`  ✓ Apagados ${cmdSnap.size} comandos pendentes.`);
   }
 
+  // ── 2c) Estado do Day Trading legado da app (dtState) ──
+  // O painel "Trades de Hoje" da app guarda os seus próprios trades aqui, à parte
+  // da coleção 'trades'. São um resíduo da app antiga (quando a app fazia day-trade
+  // local). Agora o day-trade real é do bot (coleção 'trades'). Limpamos os trades
+  // do dtState mas preservamos as DEFINIÇÕES (alvo, SL, confiança, ativos).
+  if (EXECUTAR) {
+    const dtRef = userCol("settings").doc("dtState");
+    const dtSnap = await dtRef.get();
+    if (dtSnap.exists) {
+      const dt = dtSnap.data() || {};
+      await dtRef.set({ ...dt, trades: [], dailyPnl: 0 }, { merge: true });
+      console.log(`  ✓ Day Trading (dtState): trades limpos, definições preservadas.`);
+    }
+  } else {
+    console.log(`  (Pré-visualização) Limparia os trades do painel Day Trading (dtState).`);
+  }
+
   // ── 3) Repor saldo de paper (liveBalance) ao saldo real da conta Alpaca ──
   if (EXECUTAR) {
     // Após fechar tudo, o cash da Alpaca é o saldo limpo. Usa-o como ground truth.

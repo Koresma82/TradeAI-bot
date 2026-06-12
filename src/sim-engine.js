@@ -19,6 +19,33 @@ function logEvent(level, msg) {
   fb.appendLog("server", { level, msg }).catch(() => {});
 }
 
+// Calcula estatísticas históricas por ativo a partir do dailySeries (90 dias de
+// fechos que o bot já tem) e publica-as no Firestore para a app mostrar nos
+// cartões de Mercados. Sem chamadas novas a APIs — reusa dados existentes.
+function publishPriceStats() {
+  try {
+    const stats = {};
+    for (const [id, serie] of Object.entries(dailySeries)) {
+      if (!Array.isArray(serie) || serie.length < 2) continue;
+      const max90 = Math.max(...serie);
+      const min90 = Math.min(...serie);
+      const media = (arr) => arr.length ? arr.reduce((s, v) => s + v, 0) / arr.length : null;
+      const semana = media(serie.slice(-7));   // média dos últimos 7 dias
+      const mes    = media(serie.slice(-30));   // média dos últimos 30 dias
+      stats[id] = {
+        max90: +max90.toFixed(6), min90: +min90.toFixed(6),
+        avgWeek: semana != null ? +semana.toFixed(6) : null,
+        avgMonth: mes != null ? +mes.toFixed(6) : null,
+        dias: serie.length,
+      };
+    }
+    if (Object.keys(stats).length) {
+      fb.saveSetting("server", "priceStats", { stats, ts: Date.now() }).catch(() => {});
+      logger.info(`📊 Estatísticas de preço publicadas (${Object.keys(stats).length} ativos)`);
+    }
+  } catch (e) { logger.warn(`publishPriceStats falhou: ${e.message}`); }
+}
+
 const uid = () => require("crypto").randomUUID();
 
 // ── Estado em memória ─────────────────────────────────────────────────────────
@@ -770,7 +797,7 @@ async function tick() {
     // Atualizar histórico diário 1x/dia (a cada ~2880 ticks de 30s) para os indicadores
     if (tickCount % 2880 === 0) {
       prices.fetchHistory().then(h => {
-        if (Object.keys(h).length) { dailySeries = h; logger.info("📈 Histórico diário atualizado"); }
+        if (Object.keys(h).length) { dailySeries = h; logger.info("📈 Histórico diário atualizado"); publishPriceStats(); }
       }).catch(() => {});
     }
 
@@ -1269,6 +1296,7 @@ async function init() {
     dailySeries = await prices.fetchHistory();
     const n = Object.keys(dailySeries).length;
     logger.info(`📈 Histórico carregado para ${n} ativos (indicadores prontos)`);
+    publishPriceStats();
   } catch (e) {
     logger.warn(`Histórico indisponível: ${e.message} — indicadores acumulam ao vivo`);
   }
