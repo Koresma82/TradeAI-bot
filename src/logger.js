@@ -26,6 +26,7 @@ module.exports = logger;
 // interpreta as cores). Verde = ganho/sucesso, vermelho = perda. Facilita
 // localizar vendas no meio dos logs. Os códigos aparecem no ficheiro de log
 // como texto, mas na consola do Railway ficam coloridos.
-const C = { green: "\x1b[32m", red: "\x1b[31m", reset: "\x1b[0m", bold: "\x1b[1m" };
+const C = { green: "\x1b[32m", red: "\x1b[31m", cyan: "\x1b[36m", reset: "\x1b[0m", bold: "\x1b[1m" };
 logger.win  = (msg) => logger.info(`${C.green}${C.bold}${msg}${C.reset}`);
 logger.loss = (msg) => logger.info(`${C.red}${C.bold}${msg}${C.reset}`);
+logger.buy  = (msg) => logger.info(`${C.cyan}${C.bold}${msg}${C.reset}`);

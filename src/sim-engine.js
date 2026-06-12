@@ -11,7 +11,13 @@ const stats   = require("./stats");
 const aiSignals = require("./ai-signals");
 const dayTrading = require("./day-trading");
 const broker  = require("./broker");
-const { notify, tg } = require("./telegram");
+const { notify, queueOpen, tg } = require("./telegram");
+
+// Publica um evento no tab Mensagens da app (via Firestore logs/{dia}).
+// Não bloqueia o tick — falhas são silenciosas. level: buy|sell|warn|error|info.
+function logEvent(level, msg) {
+  fb.appendLog("server", { level, msg }).catch(() => {});
+}
 
 const uid = () => require("crypto").randomUUID();
 
@@ -326,6 +332,7 @@ async function checkSLTP(currentPrices) {
     const pct = pos.entryPrice ? ((closePrice - pos.entryPrice) / pos.entryPrice) * 100 : 0;
     const linha = `💰 VENDA [${reason}] ${pos.assetSym} | P&L ${pnl >= 0 ? "+" : ""}€${pnl.toFixed(2)} (${pct >= 0 ? "+" : ""}${pct.toFixed(2)}%) | $${pos.entryPrice} → $${closePrice}`;
     if (pnl >= 0) logger.win(linha); else logger.loss(linha);
+    logEvent("sell", linha);
 
     await notify(tg.tradeClose(closedTrade, pnl, reason, broker.getMode()));
   }
@@ -524,9 +531,10 @@ async function executeBuy(strategy, assetId, price, confianca) {
   // Guarda no Firestore — a app React vê em tempo real
   await fb.saveTrade("server", position);
   await fb.saveBalance("server", simBalance);
-  tg.queueOpen({ ...position, origemLabel: "🎯 Estratégias" }, broker.getMode());
+  queueOpen({ ...position, origemLabel: "🎯 Estratégias" }, broker.getMode());
 
-  logger.info(`BUY ${broker.getMode().toUpperCase()} ${assetId} | €${amount} | @$${fillPrice} | SL $${sl} | TP $${tp}${position.brokerSLTP ? " (SL/TP na corretora)" : ""}`);
+  const _mBuy = `🛒 BUY ${assetId.toUpperCase()} | €${amount} @$${fillPrice} | SL $${sl} TP $${tp}`;
+  logger.buy(_mBuy); logEvent("buy", _mBuy);
 }
 
 // ── Hooks usados pelo módulo de day trading ──────────────────────────────────
@@ -572,8 +580,9 @@ async function openDayTrade({ assetId, assetName, assetSym, price, amount, sl, t
 
   await fb.saveTrade("server", position);
   await fb.saveBalance("server", simBalance);
-  tg.queueOpen({ ...position, confianca, origemLabel: "⚡ Day Trading" }, broker.getMode());
-  logger.info(`⚡ DAYTRADE BUY ${assetId} | €${amt} @$${price} | SL $${sl} | TP $${tp} | conf ${confianca}%`);
+  queueOpen({ ...position, confianca, origemLabel: "⚡ Day Trading" }, broker.getMode());
+  const _mDt = `⚡ DAYTRADE ${assetId.toUpperCase()} | €${amt} @$${price} | conf ${confianca}%`;
+  logger.buy(_mDt); logEvent("buy", _mDt);
   return true;
 }
 
@@ -689,8 +698,9 @@ async function runAiBrain(currentPrices) {
 
     await fb.saveTrade("server", position);
     await fb.saveBalance("server", simBalance);
-    tg.queueOpen({ ...position, confianca: sg.confianca, origemLabel: viaTecnico ? "🧮 AI Técnico" : "🤖 AI Brain" }, broker.getMode());
-    logger.info(`${viaTecnico ? "🧮 AI TÉCNICO" : "🤖 AI BRAIN"} BUY ${sg.id} | €${perTrade} @$${price} | confiança ${sg.confianca}%`);
+    queueOpen({ ...position, confianca: sg.confianca, origemLabel: viaTecnico ? "🧮 AI Técnico" : "🤖 AI Brain" }, broker.getMode());
+    const _mAi = `${viaTecnico ? "🧮 AI TÉCNICO" : "🤖 AI BRAIN"} ${sg.id.toUpperCase()} | €${perTrade} @$${price} | ${sg.confianca}%`;
+    logger.buy(_mAi); logEvent("buy", _mAi);
   }
 }
 
@@ -926,6 +936,7 @@ async function tick() {
 
   } catch (err) {
     logger.error(`SimEngine tick erro: ${err.message}`);
+    logEvent("error", `Erro no motor: ${err.message}`);
     await fb.logError("sim-engine-tick", err).catch(() => {});
   }
 }
@@ -1242,6 +1253,8 @@ async function buyManual({ assetId, amount }) {
   const price = prices.getFreshPrice(assetId);
   if (!price) {
     const sym = (prices.ASSETS.find(a => a.id === assetId)?.sym) || assetId;
+    const motivo = `Ordem recusada: sem preço de mercado para ${sym} (fonte em baixo)`;
+    logEvent("warn", motivo);
     return { ok: false, reason: `sem preço de mercado atual para ${sym} (fonte de dados em baixo) — tenta novamente daqui a pouco` };
   }
   // Limite de posições MANUAIS imposto no bot (não só na app) — para o limite

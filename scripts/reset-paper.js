@@ -113,6 +113,28 @@ async function main() {
     console.log(`  (Pré-visualização) Apagaria ${live.length} registos live/paper. Sim e estratégias ficam INTACTOS.`);
   }
 
+  // ── 2b) Comandos pendentes (a fila pode ter ordens por processar) ──
+  const cmdSnap = await userCol("commands").get();
+  console.log(`Comandos na fila: ${cmdSnap.size}`);
+  if (EXECUTAR && cmdSnap.size) {
+    const batch = db.batch();
+    cmdSnap.docs.forEach(d => batch.delete(d.ref));
+    await batch.commit();
+    console.log(`  ✓ Apagados ${cmdSnap.size} comandos pendentes.`);
+  }
+
+  // ── 3) Repor saldo de paper (liveBalance) ao saldo real da conta Alpaca ──
+  if (EXECUTAR) {
+    // Após fechar tudo, o cash da Alpaca é o saldo limpo. Usa-o como ground truth.
+    const accFinal = await alpaca("/v2/account").catch(() => acc);
+    const saldoLimpo = +(+accFinal.cash).toFixed(2);
+    await userCol("settings").doc("liveBalance").set({
+      value: saldoLimpo,
+      updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+    });
+    console.log(`  ✓ liveBalance reposto a $${saldoLimpo} (cash real da Alpaca).`);
+  }
+
   if (!EXECUTAR) {
     console.log("\n→ Para executar mesmo: node scripts/reset-paper.js --executar\n");
   } else {

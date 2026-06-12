@@ -137,6 +137,36 @@ async function saveStats(uid, stats) {
   logger.info(`Stats do dia ${day} guardadas`);
 }
 
+// ── Log de eventos para a app (tab Mensagens) ───────────────────────────────
+// Acrescenta um evento ao documento do DIA (logs/{data}) via arrayUnion — uma
+// escrita pequena por evento, não um documento por evento. A app lê os últimos
+// dias e mostra-os. Mantém só 3 dias (apaga os mais antigos quando vira o dia).
+const _lastLogCleanup = { day: "" };
+async function appendLog(uid, entry) {
+  try {
+    const day = new Date().toISOString().split("T")[0];
+    const item = {
+      ts: Date.now(),
+      level: entry.level || "info",   // "info" | "buy" | "sell" | "warn" | "error"
+      msg: String(entry.msg || "").slice(0, 300),
+    };
+    await userDoc("logs", day).set(
+      { items: admin.firestore.FieldValue.arrayUnion(item), day },
+      { merge: true }
+    );
+    // Auto-limpeza: 1x por dia, apaga documentos de logs com mais de 3 dias.
+    if (_lastLogCleanup.day !== day) {
+      _lastLogCleanup.day = day;
+      const corte = new Date(Date.now() - 3 * 86400000).toISOString().split("T")[0];
+      const snap = await userCol("logs").get();
+      const batch = db.batch();
+      let n = 0;
+      snap.docs.forEach(d => { if (d.id < corte) { batch.delete(d.ref); n++; } });
+      if (n) await batch.commit();
+    }
+  } catch { /* logs não devem partir o tick */ }
+}
+
 // ── Ler saldo actual guardado ─────────────────────────────────────────────────
 async function getBalance(uid) {
   const mode = (process.env.MODE || "sim").toLowerCase();
@@ -372,6 +402,7 @@ async function catchUpArchives() {
 
 module.exports = {
   initFirebase,
+  appendLog,
   watchStrategies,
   saveTrade,
   loadOpenPositions,
