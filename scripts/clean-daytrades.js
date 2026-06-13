@@ -42,31 +42,44 @@ async function main() {
   console.log(`\n${EXECUTAR ? "🗑  MODO EXECUTAR" : "👀 PRÉ-VISUALIZAÇÃO (não altera nada)"} · UID=${USER_UID}\n`);
 
   const snap = await dtRef.get();
-  if (!snap.exists) {
-    console.log("dtState não existe — nada a limpar. ✓");
-    process.exit(0);
-  }
-
-  const dt = snap.data() || {};
+  const dt = snap.exists ? (snap.data() || {}) : {};
   const trades = Array.isArray(dt.trades) ? dt.trades : [];
   console.log(`Day-trades no dtState: ${trades.length}`);
-  console.log(`P&L diário guardado: €${(dt.dailyPnl || 0).toFixed ? (dt.dailyPnl || 0).toFixed(2) : dt.dailyPnl || 0}`);
-  console.log(`Definições (preservadas): alvo=${dt.profitTarget}% · SL=${dt.maxLoss}% · conf=${dt.minConf}% · ativos=${(dt.assets || []).length}`);
 
-  if (!trades.length) {
-    console.log("\nJá está limpo — nenhum day-trade legado para apagar. ✓");
+  // Contar CANCELADAS na coleção (ordens que nunca abriram — ex.: loop de GLD).
+  const canc = await db.collection("users").doc(USER_UID).collection("trades")
+    .where("status", "==", "CANCELADA").get().catch(() => null);
+  const nCanc = canc ? canc.size : 0;
+  console.log(`Trades CANCELADA na coleção: ${nCanc}`);
+
+  if (!trades.length && !nCanc) {
+    console.log("\nJá está limpo — nada para apagar. ✓");
     process.exit(0);
   }
 
   if (!EXECUTAR) {
-    console.log(`\n(Pré-visualização) Apagaria ${trades.length} day-trade(s) legado(s). As definições ficam intactas.`);
+    console.log(`\n(Pré-visualização) Apagaria ${trades.length} day-trade(s) do dtState e ${nCanc} CANCELADA(s).`);
     console.log("Para executar:  node scripts/clean-daytrades.js --executar\n");
     process.exit(0);
   }
 
-  await dtRef.set({ ...dt, trades: [], dailyPnl: 0 }, { merge: true });
-  console.log(`\n✓ ${trades.length} day-trade(s) legado(s) apagado(s) do dtState.`);
-  console.log("✓ Definições do day-trade preservadas.");
+  // Limpar dtState (se tiver trades)
+  if (trades.length) {
+    await dtRef.set({ ...dt, trades: [], dailyPnl: 0 }, { merge: true });
+    console.log(`\n✓ ${trades.length} day-trade(s) legado(s) apagado(s) do dtState.`);
+  }
+
+  // Limpar CANCELADAS da coleção
+  if (canc && canc.size) {
+    let n = 0;
+    for (let i = 0; i < canc.docs.length; i += 450) {
+      const batch = db.batch();
+      canc.docs.slice(i, i + 450).forEach(d => { batch.delete(d.ref); n++; });
+      await batch.commit();
+    }
+    console.log(`✓ ${n} trade(s) CANCELADA apagado(s) da coleção (ordens que nunca abriram).`);
+  }
+
   console.log("\nNota: o day-trade real continua a ser feito pelo bot (lista paper).\n");
   process.exit(0);
 }

@@ -513,8 +513,9 @@ async function executeBuy(strategy, assetId, price, confianca) {
   const exec = await broker.buy({ assetId, amount, price, sl, tp });
   if (!exec.ok) {
     logger.warn(`Compra ${assetId} não executada: ${exec.reason}`);
-    // Limpar o registo PENDING que criámos (a ordem não foi aceite).
-    if (broker.isLive()) await fb.updateTrade("server", posId, { status: "CANCELADA", closedTs: Date.now() }).catch(() => {});
+    // Limpar o registo PENDING que criámos (a ordem não foi aceite) — apagar em
+    // vez de marcar CANCELADA, para não poluir o histórico com ordens que nunca abriram.
+    if (broker.isLive()) await fb.deleteTrade("server", posId).catch(() => {});
     return;
   }
   // Fix 1/6: preço e unidades REAIS de execução. Se a corretora confirmou uma
@@ -610,7 +611,7 @@ async function openDayTrade({ assetId, assetName, assetSym, price, amount, sl, t
   const exec = await broker.buy({ assetId, amount: amt, price, sl, tp });
   if (!exec.ok) {
     logger.warn(`Day-trade ${assetSym} não executado: ${exec.reason}`);
-    if (broker.isLive()) await fb.updateTrade("server", posId, { status: "CANCELADA", closedTs: Date.now() }).catch(() => {});
+    if (broker.isLive()) await fb.deleteTrade("server", posId).catch(() => {});
     return false;
   }
   const fillPrice = exec.fillPrice || price;
@@ -751,7 +752,13 @@ async function runAiBrain(currentPrices) {
     const exec = await broker.buy({ assetId: sg.id, amount: perTrade, price, sl, tp });
     if (!exec.ok) {
       logger.warn(`AI-Brain ${sg.id} não executado: ${exec.reason}`);
-      if (broker.isLive()) await fb.updateTrade("server", posId, { status: "CANCELADA", closedTs: Date.now() }).catch(() => {});
+      // COOLDOWN NA FALHA: impõe a mesma pausa que num sucesso, para NÃO retentar
+      // o mesmo ativo a cada tick (evita o loop de centenas de tentativas — ex.:
+      // GLD a ser tentado sem parar quando a corretora rejeita).
+      aiBrainCooldown[sg.id] = Date.now();
+      // Apaga o pré-registo PENDING (em vez de o deixar como CANCELADA) — assim
+      // uma ordem que nunca chegou a abrir não polui o histórico.
+      if (broker.isLive()) await fb.deleteTrade("server", posId).catch(() => {});
       continue;
     }
     const fillPrice = exec.fillPrice || price;

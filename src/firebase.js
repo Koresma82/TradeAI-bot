@@ -128,6 +128,11 @@ async function saveSetting(uid, key, value) {
 }
 
 // ── Guardar snapshot de stats diárias ────────────────────────────────────────
+// Apaga um trade (ex.: pré-registo PENDING cuja ordem falhou — não poluir histórico).
+async function deleteTrade(uid, id) {
+  await userCol("trades").doc(id).delete();
+}
+
 async function saveStats(uid, stats) {
   const day = new Date().toISOString().split("T")[0];
   await userDoc("stats", day).set({
@@ -439,6 +444,7 @@ async function checkDayRollover() {
 module.exports = {
   initFirebase,
   appendLog,
+  deleteTrade,
   checkDayRollover,
   watchStrategies,
   saveTrade,

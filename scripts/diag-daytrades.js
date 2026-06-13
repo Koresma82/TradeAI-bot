@@ -54,6 +54,19 @@ async function main() {
     }
   }
 
+  // 4) Procurar "Cobre"/"WTI"/"Ethereum" em TODAS as settings (qualquer chave)
+  console.log("\n🔍 A procurar 'Cobre/WTI' em TODAS as settings do teu UID...");
+  const setSnap = await db.collection("users").doc(USER_UID).collection("settings").get();
+  for (const d of setSnap.docs) {
+    const raw = JSON.stringify(d.data() || {});
+    if (/copper|cobre|WTI|Petróleo|4\.33|98\.27|1651\.21/i.test(raw)) {
+      console.log(`   ⚠ ENCONTRADO na setting "${d.id}" (tamanho: ${raw.length} chars)`);
+      // mostrar uma amostra
+      console.log(`      amostra: ${raw.slice(0, 300)}`);
+    }
+  }
+  console.log("   (se nada acima, os trades NÃO estão em nenhuma setting)");
+
   console.log("\n✓ Diagnóstico concluído.\n");
   process.exit(0);
 }
