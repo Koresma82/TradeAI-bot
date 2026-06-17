@@ -163,7 +163,9 @@ async function appendLog(uid, entry) {
     if (_lastLogCleanup.day !== day) {
       _lastLogCleanup.day = day;
       const corte = new Date(Date.now() - 3 * 86400000).toISOString().split("T")[0];
-      const snap = await userCol("logs").get();
+      // .select() sem campos lê só os IDs dos docs (não os arrays 'items', que
+      // podem ser grandes) — basta a data (= id) para decidir o que apagar.
+      const snap = await userCol("logs").select().get();
       const batch = db.batch();
       let n = 0;
       snap.docs.forEach(d => { if (d.id < corte) { batch.delete(d.ref); n++; } });

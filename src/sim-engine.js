@@ -56,6 +56,7 @@ let dailySeries   = {};  // { assetId: [fechos diários] } — para indicadores 
 let noPriceWarned = {};  // { assetId: ts } — controlo de avisos "sem preço"
 let lastBuyTime   = {};  // cooldown por estratégia/ativo
 let lastLossTime  = {};  // cooldown pós-perda por ativo (mais longo após um SL)
+let lastRotAt     = 0;   // timestamp da última ROTAÇÃO (throttle anti-microtrading)
 let botPaused     = false; // pausa de novas entradas (toggle na app; SL/TP continua)
 let tickCount     = 0;
 let totalInvested = 0;
@@ -70,6 +71,9 @@ const PRICES_PUB_MS    = 2 * 60 * 1000;   // publica preços p/ a app a cada 2 m
 let lastPricesAt       = 0;
 let lastPricesJson     = "";   // último marketPrices publicado (só reescreve se mudar)
 const HEARTBEAT_MS     = 2 * 60 * 1000;   // heartbeat a cada 2 min (app exige < 3 min)
+let lastBrokerBalJson  = "";   // últimos brokerBalances escritos (só reescreve se mudar)
+let lastBrokerBalAt    = 0;    // timestamp da última leitura de saldos da corretora
+const BROKERBAL_MS     = 5 * 60 * 1000;   // lê saldos da corretora no máx. a cada 5 min
 // Definições lidas do Firestore (a app controla isto)
 let appSettings   = {
   maxEstrategias: 5,
@@ -454,6 +458,14 @@ async function executeBuy(strategy, assetId, price, confianca) {
       // Limite cheio, rotação desligada → não compra
       return;
     }
+    // Throttle global de rotações: no máximo 1 rotação por ROT_COOLDOWN_MIN (def. 5
+    // min). Sem isto, vários sinais no mesmo tick podiam disparar uma cascata de
+    // rotações (abre/fecha em série) — a assinatura dos 424 trades/dia. A trava é
+    // sobre o ATO de rodar, independente do ativo: evita o ciclo de microtrading.
+    const rotCdMs = (parseInt(process.env.ROT_COOLDOWN_MIN || "5", 10)) * 60000;
+    if (Date.now() - lastRotAt < rotCdMs) {
+      return; // rodou há pouco — não roda outra vez já
+    }
     // ── ROTAÇÃO: vender a posição com mais lucro LÍQUIDO para abrir esta ──
     let bestWinner = null, bestNet = -Infinity, bestCur = 0, bestFee = 0;
     for (const pos of stratPositions) {
@@ -472,6 +484,12 @@ async function executeBuy(strategy, assetId, price, confianca) {
     if (!bestWinner || bestNet < minGanho) {
       return; // nenhuma posição com lucro suficiente para justificar a rotação
     }
+    // Marca o throttle ASSIM que decidimos rodar (antes de qualquer await), para
+    // que ticks concorrentes não disparem outra rotação em paralelo.
+    lastRotAt = Date.now();
+    // Põe o ativo VENDIDO em cooldown de reentrada — impede o vai-e-vem de o
+    // recomprar no tick seguinte (rodava-o para fora e voltava a entrar nele).
+    lastBuyTime[`${bestWinner.stratId}_${bestWinner.assetId}`] = Date.now();
     // Fechar o vencedor (P&L líquido de comissões)
     const cur = bestCur;
     const bestPnl = +bestNet.toFixed(4);
@@ -1007,20 +1025,26 @@ async function tick() {
       });
       lastHeartbeatAt  = now;
       lastFeaturesJson = featuresJson;
+    }
 
-      // ── Saldos por broker (só em paper/real) → a app mostra-os no Portfólio ──
-      if (broker.isLive() && broker.registry) {
-        try {
-          const balances = {};
-          for (const a of broker.registry.available()) {
-            try { const b = await a.getBalance(); if (b != null) balances[a.id] = +(+b).toFixed(2); }
-            catch (e) { logger.warn(`Saldo ${a.id} falhou: ${e.message}`); }
-          }
-          if (Object.keys(balances).length) {
-            await fb.saveSetting("server", "brokerBalances", balances);
-          }
-        } catch (e) { logger.warn(`brokerBalances não publicado: ${e.message}`); }
-      }
+    // ── Saldos por broker (só em paper/real) → a app mostra-os no Portfólio ──
+    // Desacoplado do heartbeat: cada leitura faz N chamadas HTTP à corretora,
+    // por isso lê no máx. a cada BROKERBAL_MS (5 min) e só escreve no Firestore
+    // se o saldo MUDOU. Antes corria a cada heartbeat (2 min) sem dedupe.
+    if (broker.isLive() && broker.registry && now - lastBrokerBalAt >= BROKERBAL_MS) {
+      lastBrokerBalAt = now;
+      try {
+        const balances = {};
+        for (const a of broker.registry.available()) {
+          try { const b = await a.getBalance(); if (b != null) balances[a.id] = +(+b).toFixed(2); }
+          catch (e) { logger.warn(`Saldo ${a.id} falhou: ${e.message}`); }
+        }
+        const balJson = JSON.stringify(balances);
+        if (Object.keys(balances).length && balJson !== lastBrokerBalJson) {
+          await fb.saveSetting("server", "brokerBalances", balances);
+          lastBrokerBalJson = balJson;
+        }
+      } catch (e) { logger.warn(`brokerBalances não publicado: ${e.message}`); }
     }
 
   } catch (err) {
