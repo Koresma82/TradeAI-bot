@@ -67,8 +67,12 @@ function roundTripFee(assetId, amount) {
 }
 
 // Preferência por classe (ordem = prioridade). Failover segue esta ordem.
+// Intenção do utilizador em REAL: crypto→Binance, ações/ETF/commodity→Alpaca.
+// Em PAPER a Binance não está configurada (não tem paper), por isso o failover
+// leva a crypto para a Alpaca paper automaticamente — sem precisar de mudar nada.
+// Para forçar outra rota, define BROKER_ROUTING no .env (ver parseRouting).
 const DEFAULT_ROUTING = {
-  crypto:    ["alpaca", "binance"], // crypto: Alpaca primeiro (tem paper); Binance se quiseres real
+  crypto:    ["binance", "alpaca"], // REAL: Binance. PAPER: cai p/ Alpaca (failover).
   etf:       ["alpaca"],
   stock:     ["alpaca"],
   commodity: ["alpaca"],
@@ -91,10 +95,31 @@ const ROUTING = parseRouting();
 // Tenta a ordem de preferência da classe; aceita o primeiro disponível que
 // suporta o ativo. Se nenhum da lista servir, tenta QUALQUER disponível que
 // suporte (failover total). Devolve null se ninguém puder.
+//
+// GUARDA DE SEGURANÇA paper↔real: a Binance NÃO tem conta paper — só executa
+// ordens REAIS (ou testnet). Por isso, em MODE=paper, recusamos qualquer broker
+// que esteja a apontar para produção live (ex.: Binance com chaves reais). Isto
+// impede o cenário perigoso de "estou em paper mas a crypto foi para a Binance
+// real". Em MODE=real, todos os brokers live são permitidos.
+function adapterAllowedInMode(a) {
+  if (MODE === "real") return true;            // real → tudo permitido
+  if (!LIVE) return true;                       // sim → não executa de qualquer forma
+  // MODE === "paper": só permitir adaptadores que NÃO estejam em produção live.
+  // Alpaca paper → isLive() é false (URL contém "paper") → permitido.
+  // Binance com chaves reais → isLive() é true → BLOQUEADO em paper.
+  // Binance testnet → isLive() é false → permitido.
+  try {
+    if (typeof a.isLive === "function" && a.isLive()) {
+      return false;
+    }
+  } catch { /* se não souber, é mais seguro permitir só não-live abaixo */ }
+  return true;
+}
+
 function pickAdapter(assetId) {
   const cls   = assetClass(assetId);
   const prefs = ROUTING[cls] || [];
-  const avail = registry.available();
+  const avail = registry.available().filter(adapterAllowedInMode);
 
   for (const id of prefs) {
     const a = avail.find(x => x.id === id && x.supports(assetId));

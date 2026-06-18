@@ -45,17 +45,24 @@ async function signedFetch(path, params = {}, method = "GET") {
   return data;
 }
 
-// LOT_SIZE: a Binance exige quantidades arredondadas ao "step" de cada par.
-// Cache dos filtros do exchangeInfo para arredondar corretamente.
-let stepCache = {};
-async function getStep(symbol) {
-  if (stepCache[symbol]) return stepCache[symbol];
+// Filtros do par: a Binance exige (a) quantidade múltipla do "step" (LOT_SIZE),
+// (b) quantidade ≥ minQty, e (c) valor da ordem ≥ minNotional (senão rejeita com
+// -1013 "Filter failure: NOTIONAL"). Cache do exchangeInfo para validar ordens.
+let filterCache = {};
+async function getFilters(symbol) {
+  if (filterCache[symbol]) return filterCache[symbol];
   const r = await fetch(`${BASE_URL}/api/v3/exchangeInfo?symbol=${symbol}`);
   const data = await r.json();
-  const lot = data.symbols?.[0]?.filters?.find(f => f.filterType === "LOT_SIZE");
-  const step = lot ? parseFloat(lot.stepSize) : 0.00001;
-  stepCache[symbol] = step;
-  return step;
+  const filters = data.symbols?.[0]?.filters || [];
+  const lot = filters.find(f => f.filterType === "LOT_SIZE");
+  const notional = filters.find(f => f.filterType === "NOTIONAL" || f.filterType === "MIN_NOTIONAL");
+  const out = {
+    step:        lot ? parseFloat(lot.stepSize) : 0.00001,
+    minQty:      lot ? parseFloat(lot.minQty)   : 0,
+    minNotional: notional ? parseFloat(notional.minNotional ?? notional.notional ?? 0) : 0,
+  };
+  filterCache[symbol] = out;
+  return out;
 }
 function roundToStep(qty, step) {
   const precision = Math.max(0, Math.round(-Math.log10(step)));
@@ -95,6 +102,14 @@ module.exports = {
     const symbol = pair(assetId);
     if (!symbol) return { ok: false, reason: "unsupported_asset" };
     try {
+      // Validar MIN_NOTIONAL antes de enviar: a Binance rejeita ordens cujo valor
+      // (quoteOrderQty) seja inferior ao mínimo do par (tipicamente ~$5-10).
+      // Falhar aqui com mensagem clara é melhor do que um -1013 críptico.
+      const f = await getFilters(symbol);
+      if (f.minNotional > 0 && amount < f.minNotional) {
+        logger.warn(`[Binance] BUY ${symbol} ignorada: valor $${amount.toFixed(2)} < mínimo $${f.minNotional} (MIN_NOTIONAL)`);
+        return { ok: false, reason: `below_min_notional:${f.minNotional}` };
+      }
       const order = await signedFetch("/api/v3/order", {
         symbol, side: "BUY", type: "MARKET",
         quoteOrderQty: amount.toFixed(2), // gasta este valor em USDT
@@ -103,6 +118,9 @@ module.exports = {
       let fillPrice = price, qty = 0, cost = 0;
       (order.fills || []).forEach(f => { qty += parseFloat(f.qty); cost += parseFloat(f.qty) * parseFloat(f.price); });
       if (qty > 0) fillPrice = cost / qty;
+      // Devolve as unidades REAIS preenchidas — o motor deve guardar ESTAS (não
+      // amount/price), senão tenta vender mais do que tem (dust preso). Crítico
+      // porque a Binance cobra a comissão em unidades da própria crypto.
       return { ok: true, fillPrice, brokerOrderId: String(order.orderId), simulated: false, filledUnits: qty };
     } catch (err) {
       logger.error(`[Binance] compra falhou (${symbol}): ${err.message}`);
@@ -115,16 +133,27 @@ module.exports = {
     const symbol = pair(assetId);
     if (!symbol) return { ok: false, reason: "unsupported_asset" };
     try {
-      const step = await getStep(symbol);
-      const qty  = roundToStep(units, step);
-      if (qty <= 0) return { ok: false, reason: "qty_below_min" };
+      const f   = await getFilters(symbol);
+      const qty = roundToStep(units, f.step);
+      if (qty <= 0 || (f.minQty > 0 && qty < f.minQty)) {
+        // "Dust": a posição que sobra é tão pequena que fica abaixo do mínimo
+        // vendável da Binance. Não dá erro — sinaliza para o motor poder fechar a
+        // posição contabilisticamente (não vamos conseguir vender estas migalhas).
+        logger.warn(`[Binance] SELL ${symbol}: ${units} → ${qty} abaixo do mínimo vendável (dust). Posição fechada contabilisticamente.`);
+        return { ok: true, dust: true, fillPrice: price, filledUnits: 0, simulated: false };
+      }
+      // Validar também o MIN_NOTIONAL na venda (valor = qty × preço).
+      if (f.minNotional > 0 && price && qty * price < f.minNotional) {
+        logger.warn(`[Binance] SELL ${symbol}: valor $${(qty*price).toFixed(2)} < mínimo $${f.minNotional} (dust). Posição fechada contabilisticamente.`);
+        return { ok: true, dust: true, fillPrice: price, filledUnits: 0, simulated: false };
+      }
       const order = await signedFetch("/api/v3/order", {
         symbol, side: "SELL", type: "MARKET", quantity: qty,
       }, "POST");
       let fillPrice = price, q = 0, cost = 0;
       (order.fills || []).forEach(f => { q += parseFloat(f.qty); cost += parseFloat(f.qty) * parseFloat(f.price); });
       if (q > 0) fillPrice = cost / q;
-      return { ok: true, fillPrice, simulated: false };
+      return { ok: true, fillPrice, filledUnits: q, simulated: false };
     } catch (err) {
       logger.error(`[Binance] venda falhou (${symbol}): ${err.message}`);
       return { ok: false, reason: err.message };

@@ -42,13 +42,35 @@ function dropFromHigh(prices) {
 //  1. Queda desde o máximo >= o gatilho da estratégia (comprar na baixa)
 //  2. RSI em sobrevenda (< limiar, default 35)
 //  3. Preço acima da média longa (tendência de fundo ainda positiva)
+//
+// VETO DE TENDÊNCIA (correção do buraco da ADA, −83€ em 4 dias): por muito alto
+// que seja o score de "queda + RSI baixo", NÃO compramos um ativo em tendência
+// de baixa CLARA. Isto impede o padrão "apanhar a faca a cair" — recomprar um
+// ativo dia após dia enquanto desce (queda + RSI baixo davam sempre sinal, e o
+// SL batia sempre). Um ativo em queda continuada não está "barato", está a cair.
 function buySignal(prices, { dropTrigger = 1.5, rsiOversold = 35, smaLong = 50 } = {}) {
   if (prices.length < 15) return { buy: false, reason: "histórico insuficiente", score: 0 };
 
   const drop   = dropFromHigh(prices);
   const r       = rsi(prices, 14);
   const maLong  = sma(prices, Math.min(smaLong, prices.length));
+  const maShort = sma(prices, Math.min(10, prices.length));
   const last    = prices[prices.length - 1];
+
+  // ── VETO: tendência de baixa estrutural ──
+  // Considera-se "em queda" se: (a) o preço está abaixo da média longa E
+  // (b) a média curta está abaixo da longa (as médias confirmam a descida) E
+  // (c) o preço de hoje é menor que o de há ~5 períodos (continua a descer).
+  // Estar sobrevendido (RSI baixo) numa tendência destas NÃO é oportunidade —
+  // é o ativo a cair. Bloqueamos a compra independentemente do score.
+  const ref5 = prices[Math.max(0, prices.length - 6)];
+  const abaixoMM   = maLong  != null && last < maLong;
+  const mmCruzada  = maLong  != null && maShort != null && maShort < maLong;
+  const aDescer    = ref5 != null && last < ref5;
+  const tendenciaBaixa = abaixoMM && mmCruzada && aDescer;
+  if (tendenciaBaixa) {
+    return { buy: false, score: 0, reason: "veto: tendência de baixa (não apanhar faca a cair)", rsi: r, vetoTrend: true };
+  }
 
   let score = 0;
   const reasons = [];

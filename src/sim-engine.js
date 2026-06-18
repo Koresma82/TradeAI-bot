@@ -117,7 +117,18 @@ let appSettings   = {
     daytrading:  { valorFixo: 0, maxValorTrade: 0 },
     manual:      { valorFixo: 0, maxValorTrade: 0 },
   },
+  // ── Modo dinâmico por regime de mercado ──────────────────────────────────
+  // Quando ligado, o bot REDUZ exposição e APERTA entradas automaticamente em
+  // regime de baixa (BTC e SPY ambos abaixo da MM50 e a descer). Não mexe em
+  // SL/TP (isso seria curve-fitting). Os limites do utilizador são o TETO; o
+  // modo dinâmico só os reduz, nunca aumenta. Sempre visível e desligável.
+  regimeDinamico: false,   // interruptor mestre (off = limites fixos de sempre)
 };
+// Estado do regime de mercado (recalculado periodicamente, não a cada tick).
+let regimeAtual    = "neutro";   // "alta" | "neutro" | "baixa"
+let regimeDetalhe  = "";          // texto explicativo p/ app e logs
+let lastRegimeAt   = 0;
+const REGIME_MS    = 10 * 60 * 1000; // reavalia o regime a cada 10 min
 let dtConfig = null; // config de day trading lida da app (dtState)
 let simBalance    = parseFloat(process.env.SIM_CAPITAL || "1000");
 let simCapital    = simBalance;
@@ -128,6 +139,82 @@ const TRADEABLE = new Set(prices.ASSETS.map(a => a.id));
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 const sign = v => v >= 0 ? "+" : "−";
+
+// ── Regime de mercado ─────────────────────────────────────────────────────────
+// Deteta o "humor" do mercado a partir de dois sinais INDEPENDENTES: BTC (cripto)
+// e SPY (ações). Usar dois reduz falsos positivos — um dip só do BTC não dispara
+// o modo defensivo. Critério por ativo (sobre os fechos diários):
+//   • abaixo da MM50  → preço < média móvel de 50 dias (tendência de fundo fraca)
+//   • a descer        → fecho de hoje < fecho de há ~5 dias
+// Regime:
+//   • "baixa"  → AMBOS (BTC e SPY) abaixo da MM50 e a descer  → reduzir risco
+//   • "alta"   → AMBOS acima da MM50 e a subir                → normal/favorável
+//   • "neutro" → tudo o resto (sinais mistos)                 → cautela ligeira
+// Só recalcula a cada REGIME_MS (não a cada tick) — é uma leitura de fundo, não
+// de tick. Resultado guardado em regimeAtual/regimeDetalhe (visível na app).
+function avaliaRegime() {
+  const lerAtivo = (id) => {
+    const serie = dailySeries[id] || [];
+    if (serie.length < 20) return null; // histórico insuficiente → ignora este sinal
+    const ma = indicators.sma(serie, Math.min(50, serie.length));
+    const last = serie[serie.length - 1];
+    const ref = serie[Math.max(0, serie.length - 6)];
+    if (ma == null) return null;
+    return { abaixoMM: last < ma, aDescer: last < ref, acimaMM: last > ma, aSubir: last > ref };
+  };
+  const btc = lerAtivo("btc");
+  const spy = lerAtivo("spy");
+  // Se não temos os dois sinais, não arriscamos uma leitura — fica neutro.
+  if (!btc || !spy) {
+    regimeAtual = "neutro";
+    regimeDetalhe = "histórico insuficiente para avaliar regime";
+    return;
+  }
+  const baixa = (btc.abaixoMM && btc.aDescer) && (spy.abaixoMM && spy.aDescer);
+  const alta  = (btc.acimaMM  && btc.aSubir)  && (spy.acimaMM  && spy.aSubir);
+  if (baixa)      { regimeAtual = "baixa";  regimeDetalhe = "BTC e SPY abaixo da MM50 e a descer — modo defensivo"; }
+  else if (alta)  { regimeAtual = "alta";   regimeDetalhe = "BTC e SPY acima da MM50 e a subir — condições favoráveis"; }
+  else            { regimeAtual = "neutro"; regimeDetalhe = "sinais mistos entre cripto e ações"; }
+}
+
+// Multiplicadores de EXPOSIÇÃO por regime. Aplicam-se SÓ para REDUZIR (≤ 1.0):
+// o utilizador define o teto; o regime só aperta. Base matemática: numa queda,
+// reduzir o nº de posições e o valor por trade baixa a perda esperada por dia
+// proporcionalmente, sem precisar de prever nada. Em alta, mantém-se (1.0) — não
+// aumentamos além do que o utilizador definiu. Bónus à confiança AI em baixa:
+// exigir sinais mais fortes filtra as entradas marginais que mais perdem.
+function regimeFatores() {
+  // Sem modo dinâmico → tudo neutro (sem ajuste). É o fallback de limites fixos.
+  if (!appSettings.regimeDinamico) {
+    return { posicoes: 1.0, valor: 1.0, confExtra: 0, regime: "fixo" };
+  }
+  switch (regimeAtual) {
+    case "baixa":
+      // Defensivo: metade das posições simultâneas, 60% do valor por trade, e
+      // +8 pontos de confiança mínima exigida ao AI-Brain/estratégias.
+      return { posicoes: 0.5, valor: 0.6, confExtra: 8, regime: "baixa" };
+    case "alta":
+      return { posicoes: 1.0, valor: 1.0, confExtra: 0, regime: "alta" };
+    default: // neutro: cautela ligeira
+      return { posicoes: 0.8, valor: 0.9, confExtra: 3, regime: "neutro" };
+  }
+}
+
+// Aplica o fator de exposição a um limite de Nº de posições (arredonda para baixo,
+// mas nunca abaixo de 1 se o limite original era ≥ 1 — não queremos parar tudo).
+function limitePosicoes(base) {
+  const f = regimeFatores().posicoes;
+  const n = Math.floor(Number(base) * f);
+  return Number(base) >= 1 ? Math.max(1, n) : n;
+}
+// Aplica o fator de valor a um valor (€) por trade.
+function valorAjustado(base) {
+  return +(Number(base) * regimeFatores().valor).toFixed(2);
+}
+// Confiança mínima efetiva (base + extra do regime), nunca acima de 95.
+function confMinima(base) {
+  return Math.min(95, Number(base) + regimeFatores().confExtra);
+}
 const eur  = v => `€${Math.abs(v).toFixed(2)}`;
 
 // Categorias por ativo (para saber se o mercado está aberto)
@@ -238,17 +325,34 @@ async function checkSLTP(currentPrices) {
     const podeAiExit = idadeMs >= 120000; // 2 min
 
     // ── Saída antecipada se a IA virar para VENDER com confiança ──
-    // Só fecha SE o lucro LÍQUIDO (após comissões ida-e-volta) for positivo com
-    // uma margem mínima. Antes, fechávamos em qualquer micro-lucro (+€0.01), que
-    // em cripto (0.25%/lado) seria PERDA depois das comissões. Agora o AI-EXIT
-    // só dispara se valer mesmo a pena.
+    // AI-EXIT BIDIRECIONAL (corrige a assimetria ganho/perda):
+    //   • EM LUCRO  → realiza o ganho (como antes), mas só se o lucro LÍQUIDO
+    //                 (após comissões) tiver margem mínima — evita "ganhar" no
+    //                 papel mas perder nas taxas (sobretudo cripto a 0.25%/lado).
+    //   • EM PERDA  → CORTA a perda mais cedo. Antes, uma posição perdedora só
+    //                 saía no SL completo (−3%), enquanto as vencedoras saíam a
+    //                 +0.4% → ganho médio +0.40€ vs perda média −3.00€ (rácio 1:7).
+    //                 Agora, se a IA vira para VENDER com confiança ALTA, fechamos
+    //                 a meio da queda em vez de esperar o SL — reduz a perda média.
+    // Para cortar perdas exigimos confiança MAIOR (flipConf + margem) do que para
+    // realizar lucros, porque fechar no vermelho é uma decisão mais cara: só o
+    // fazemos quando o sinal de reversão é forte, não a qualquer hesitação da IA.
     const sg = aiSignals.getSignal(pos.assetId);
     const rtFee = broker.roundTripFee(pos.assetId, pos.amount); // comissão compra+venda (€)
-    const minLucro = rtFee + (pos.amount * 0.0010); // comissões + 0.10% de margem
     const lucroLiquidoSeFechar = (price - pos.entryPrice) * pos.units - rtFee;
-    const valeAPena = lucroLiquidoSeFechar >= (pos.amount * 0.0010); // lucro líq. acima da margem
-    if (!onHold && podeAiExit && exitOnFlip && sg && sg.sinal === "VENDER" && (sg.confianca || 0) >= flipConf && valeAPena && price > pos.sl) {
+    const margem = pos.amount * 0.0010;                  // 0.10% de margem mínima
+    const emLucro = lucroLiquidoSeFechar >= margem;       // lucro líq. acima da margem
+    const conf = sg?.confianca || 0;
+    const cutLossConf = Math.min(95, flipConf + 7);       // exige sinal mais forte p/ cortar perda
+    const aiVende = !onHold && podeAiExit && exitOnFlip && sg && sg.sinal === "VENDER";
+    if (aiVende && emLucro && conf >= flipConf && price > pos.sl) {
+      // Realiza lucro: a IA virou e estamos no verde com margem.
       reason = "AI-EXIT"; closePrice = price;
+    }
+    else if (aiVende && !emLucro && conf >= cutLossConf && price > pos.sl) {
+      // Corta perda: a IA virou com confiança ALTA e a posição está no vermelho.
+      // Sair aqui (acima do SL) perde MENOS do que esperar o SL completo.
+      reason = "AI-CUT"; closePrice = price;
     }
     else if (price <= pos.sl) {
       // Carência de SL para posições MANUAIS: nos primeiros 60s não fecha por SL,
@@ -389,7 +493,8 @@ function suggestAmount(assetId, confianca, strategy, origem) {
   // Modo "fixo": valor da origem > valor da estratégia > valorFixo global.
   if (appSettings.modoValor !== "percentagem") {
     const base = valOrigem != null ? valOrigem : (strategy.perTrade || appSettings.valorFixo || 10);
-    return Math.min(base, avail, tetoAbs);
+    // valorAjustado() reduz o valor por trade em regime de baixa (modo dinâmico).
+    return Math.min(valorAjustado(base), avail, tetoAbs);
   }
 
   // Modo "% da Banca": dimensiona pelo perfil de risco + confiança + saldo.
@@ -408,7 +513,8 @@ function suggestAmount(assetId, confianca, strategy, origem) {
   let amount = avail * pctBase * mult;
   amount = Math.min(amount, avail * cfg.teto);
   amount = Math.max(10, Math.min(amount, avail, tetoAbs)); // ← teto absoluto aplicado aqui
-  return +amount.toFixed(2);
+  // valorAjustado() reduz o valor por trade em regime de baixa (modo dinâmico).
+  return +valorAjustado(amount).toFixed(2);
 }
 
 // ── Executar compra simulada ──────────────────────────────────────────────────
@@ -449,7 +555,8 @@ async function executeBuy(strategy, assetId, price, confianca) {
 
   // Limite de posições de estratégia (só conta estratégias — AI-Brain, manual e
   // day-trade têm os seus próprios limites e não roubam vagas às estratégias).
-  const maxStrat = appSettings.maxEstrategias || 5;
+  // limitePosicoes() reduz este teto em regime de baixa (modo dinâmico).
+  const maxStrat = limitePosicoes(appSettings.maxEstrategias || 5);
   const stratPositions = Object.values(openPositions).filter(
     p => p.stratId !== "manual" && p.stratId !== "daytrading" && p.stratId !== "ai-brain"
   );
@@ -661,7 +768,8 @@ async function openDayTrade({ assetId, assetName, assetSym, price, amount, sl, t
 const aiBrainCooldown = {}; // { assetId: ts }
 async function runAiBrain(currentPrices) {
   if (!appSettings.aiBrain || dailyLossHit) return;
-  const minConf  = appSettings.aiBrainConfianca || 78;
+  // confMinima() sobe a confiança exigida em regime de baixa (filtra entradas marginais).
+  const minConf  = confMinima(appSettings.aiBrainConfianca || 78);
   const maxStrat = appSettings.maxEstrategias || 5;
   const slPct    = appSettings.stopLossPadrao || 6;
   const tpPct    = appSettings.takeProfitPadrao || 12;
@@ -735,7 +843,7 @@ async function runAiBrain(currentPrices) {
     // Antes partilhavam maxEstrategias: as estratégias (que correm primeiro no
     // tick) enchiam as vagas e o AI-Brain nunca abria. Agora conta só as suas.
     const brainPositions = Object.values(openPositions).filter(p => p.stratId === "ai-brain");
-    const maxBrain = Number(appSettings.maxAiBrain) || 3;
+    const maxBrain = limitePosicoes(Number(appSettings.maxAiBrain) || 3);
     if (brainPositions.length >= maxBrain) continue;
     // Quantia por perfil+confiança+saldo (igual à app); fixo se modo != auto.
     const perTrade = Math.min(
@@ -818,6 +926,22 @@ async function tick() {
     // 1. Refresh preços
     await prices.refreshAll();
     const currentPrices = prices.getAll();
+
+    // Reavalia o REGIME de mercado a cada REGIME_MS (10 min). É uma leitura de
+    // fundo (MM50 de BTC/SPY), não muda a cada tick. Mesmo com o modo dinâmico
+    // desligado, mantemos o regime calculado para a app o poder mostrar como info.
+    if (Date.now() - lastRegimeAt >= REGIME_MS) {
+      lastRegimeAt = Date.now();
+      try {
+        const antes = regimeAtual;
+        avaliaRegime();
+        if (regimeAtual !== antes && appSettings.regimeDinamico) {
+          const emoji = regimeAtual === "baixa" ? "🔻" : regimeAtual === "alta" ? "🔼" : "➖";
+          notify(`${emoji} *Regime de mercado: ${regimeAtual.toUpperCase()}* — ${regimeDetalhe}`).catch(() => {});
+          logger.info(`Regime de mercado mudou: ${antes} → ${regimeAtual} (${regimeDetalhe})`);
+        }
+      } catch (e) { logger.warn(`avaliaRegime falhou: ${e.message}`); }
+    }
 
     // Atualizar histórico diário 1x/dia (a cada ~2880 ticks de 30s) para os indicadores
     if (tickCount % 2880 === 0) {
@@ -918,7 +1042,8 @@ async function tick() {
     await runAiBrain(currentPrices);
 
     // 3d. Day Trading 24/7 — scan com IA e abre posições rápidas (config vinda da app)
-    await dayTrading.run(dtConfig, appSettings.maxDayTrading || 5, {
+    // limitePosicoes() reduz o nº máximo de day-trades em regime de baixa.
+    await dayTrading.run(dtConfig, limitePosicoes(appSettings.maxDayTrading || 5), {
       openDayTrade, countDayTrades, hasOpen,
     }).catch(err => logger.warn(`DayTrading run: ${err.message}`));
 
@@ -1016,12 +1141,31 @@ async function tick() {
         finnhub:    { ok: ph.finnhub?.ok,    lastOk: ph.finnhub?.lastOk,    err: ph.finnhub?.lastErr, disabled: !!ph.finnhub?.disabled },
         stooq:      { ok: ph.stooq.ok,       lastOk: ph.stooq.lastOk,       err: ph.stooq.lastErr, disabled: !!ph.stooq?.disabled },
       };
+      // Câmbio: os brokers (Alpaca/Binance) operam em USD/USDT, mas o sizing e os
+      // rótulos da app pensam em EUR. Publicamos a moeda real do saldo e a taxa
+      // EUR/USD ao vivo para a app CONVERTER na exibição. O motor mantém tudo na
+      // moeda do broker (coerência interna) — a conversão é só de apresentação.
+      const fxEurUsd = prices.getFreshPrice("eurusd") || null; // USD por 1 EUR
+      const brokerCurrency = broker.isLive() ? "USD" : "EUR";  // sim = EUR puro
+      const rf = regimeFatores();
       await fb.saveSetting("server", "botStatus", {
         alive:    true,
         mode:     broker.getMode(),
         lastSeen: now,
         features,
         apiHealth,
+        currency: brokerCurrency,   // moeda real dos valores (saldo, P&L, sizing)
+        fxEurUsd,                   // taxa ao vivo: 1 EUR = fxEurUsd USD (ou null)
+        // Regime de mercado (modo dinâmico): visível na app para o utilizador
+        // perceber porque é que o bot está mais/menos agressivo num dado momento.
+        regime: {
+          ativo:    !!appSettings.regimeDinamico,
+          estado:   regimeAtual,        // "alta" | "neutro" | "baixa" | (fixo se off)
+          detalhe:  regimeDetalhe,
+          fatorPosicoes: rf.posicoes,   // ex.: 0.5 = metade das posições
+          fatorValor:    rf.valor,      // ex.: 0.6 = 60% do valor por trade
+          confExtra:     rf.confExtra,  // pontos extra de confiança exigida
+        },
       });
       lastHeartbeatAt  = now;
       lastFeaturesJson = featuresJson;
