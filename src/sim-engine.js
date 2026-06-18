@@ -215,6 +215,18 @@ function valorAjustado(base) {
 function confMinima(base) {
   return Math.min(95, Number(base) + regimeFatores().confExtra);
 }
+
+// "Carimbo" do regime no momento da abertura de um trade, para gravar no próprio
+// trade. Assim a comparação "com vs sem modo dinâmico" é DIRETA (filtra trades
+// por este campo) e não depende de cruzar datas com o registo de liga/desliga.
+//   regimeDinamico: o modo dinâmico estava ligado quando o trade abriu?
+//   regimeEstado:   que regime estava ativo ("alta"/"neutro"/"baixa"/"fixo")
+function regimeSnapshot() {
+  return {
+    regimeDinamico: !!appSettings.regimeDinamico,
+    regimeEstado:   appSettings.regimeDinamico ? regimeAtual : "fixo",
+  };
+}
 const eur  = v => `€${Math.abs(v).toFixed(2)}`;
 
 // Categorias por ativo (para saber se o mercado está aberto)
@@ -675,6 +687,7 @@ async function executeBuy(strategy, assetId, price, confianca) {
     // motor NÃO deve também fechar — senão disparam os dois (venda a descoberto).
     brokerSLTP:  !!exec.bracket,
     pendingFill: !!exec.pending, // fill provisório; reconciliação confirma depois
+    ...regimeSnapshot(),         // carimbo do regime de mercado na abertura
   };
 
   openPositions[posId] = position;
@@ -751,6 +764,7 @@ async function openDayTrade({ assetId, assetName, assetSym, price, amount, sl, t
     mode: broker.isLive() ? "live" : "sim",
     brokerOrderId: exec.brokerOrderId || null, broker: exec.broker || null,
     brokerSLTP: !!exec.bracket, pendingFill: !!exec.pending,
+    ...regimeSnapshot(),         // carimbo do regime de mercado na abertura
   };
   openPositions[posId] = position;
   totalInvested += amt;
@@ -900,6 +914,7 @@ async function runAiBrain(currentPrices) {
       mode: broker.isLive() ? "live" : "sim",
       brokerOrderId: exec.brokerOrderId || null, broker: exec.broker || null,
       brokerSLTP: !!exec.bracket, pendingFill: !!exec.pending,
+      ...regimeSnapshot(),         // carimbo do regime de mercado na abertura
     };
     openPositions[posId] = position;
     totalInvested += perTrade;
