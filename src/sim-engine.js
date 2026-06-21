@@ -10,6 +10,7 @@ const indicators = require("./indicators");
 const stats   = require("./stats");
 const aiSignals = require("./ai-signals");
 const dayTrading = require("./day-trading");
+const newsSentiment = require("./news-sentiment");
 const broker  = require("./broker");
 const { notify, queueOpen, tg } = require("./telegram");
 
@@ -123,6 +124,11 @@ let appSettings   = {
   // SL/TP (isso seria curve-fitting). Os limites do utilizador são o TETO; o
   // modo dinâmico só os reduz, nunca aumenta. Sempre visível e desligável.
   regimeDinamico: false,   // interruptor mestre (off = limites fixos de sempre)
+  // ── Camada de notícias (independente do modo dinâmico técnico) ────────────
+  // Quando ligado, o sentiment de notícias (news-sentiment.js) ajusta a
+  // EXPOSIÇÃO (nº de posições, € por trade, confiança exigida) dentro dos tetos.
+  // NUNCA mexe em SL/TP. Clima negativo aperta; clima positivo afrouxa até 1.0.
+  newsTilt: false,
 };
 // Estado do regime de mercado (recalculado periodicamente, não a cada tick).
 let regimeAtual    = "neutro";   // "alta" | "neutro" | "baixa"
@@ -130,6 +136,7 @@ let regimeDetalhe  = "";          // texto explicativo p/ app e logs
 let lastRegimeAt   = 0;
 const REGIME_MS    = 10 * 60 * 1000; // reavalia o regime a cada 10 min
 let dtConfig = null; // config de day trading lida da app (dtState)
+let newsFeed = null; // { headlines:[], manualBias?, manualLabel? } lido de settings/newsFeed
 let simBalance    = parseFloat(process.env.SIM_CAPITAL || "1000");
 let simCapital    = simBalance;
 // Ativos negociáveis: derivados da lista do prices.js (fonte única de verdade).
@@ -183,21 +190,46 @@ function avaliaRegime() {
 // proporcionalmente, sem precisar de prever nada. Em alta, mantém-se (1.0) — não
 // aumentamos além do que o utilizador definiu. Bónus à confiança AI em baixa:
 // exigir sinais mais fortes filtra as entradas marginais que mais perdem.
+//
+// CAMADA DE NOTÍCIAS: se newsTilt estiver ligado, o sentiment de notícias
+// (news-sentiment.js) acrescenta um VIÉS de exposição — mas só ajusta QUANTO se
+// arrisca, nunca os níveis de SL/TP. Um clima muito negativo aperta ainda mais;
+// um clima muito positivo pode afrouxar até (no máximo) ao TETO técnico de 1.0 —
+// nunca acima, porque "a IA está otimista" não autoriza arriscar mais do que o
+// utilizador definiu. Direção é do mercado; tamanho é do risco.
 function regimeFatores() {
-  // Sem modo dinâmico → tudo neutro (sem ajuste). É o fallback de limites fixos.
+  // Base técnica do regime.
+  let base;
   if (!appSettings.regimeDinamico) {
-    return { posicoes: 1.0, valor: 1.0, confExtra: 0, regime: "fixo" };
+    base = { posicoes: 1.0, valor: 1.0, confExtra: 0, regime: "fixo" };
+  } else {
+    switch (regimeAtual) {
+      case "baixa":
+        // Defensivo: metade das posições simultâneas, 60% do valor por trade, e
+        // +8 pontos de confiança mínima exigida ao AI-Brain/estratégias.
+        base = { posicoes: 0.5, valor: 0.6, confExtra: 8, regime: "baixa" }; break;
+      case "alta":
+        base = { posicoes: 1.0, valor: 1.0, confExtra: 0, regime: "alta" }; break;
+      default: // neutro: cautela ligeira
+        base = { posicoes: 0.8, valor: 0.9, confExtra: 3, regime: "neutro" };
+    }
   }
-  switch (regimeAtual) {
-    case "baixa":
-      // Defensivo: metade das posições simultâneas, 60% do valor por trade, e
-      // +8 pontos de confiança mínima exigida ao AI-Brain/estratégias.
-      return { posicoes: 0.5, valor: 0.6, confExtra: 8, regime: "baixa" };
-    case "alta":
-      return { posicoes: 1.0, valor: 1.0, confExtra: 0, regime: "alta" };
-    default: // neutro: cautela ligeira
-      return { posicoes: 0.8, valor: 0.9, confExtra: 3, regime: "neutro" };
+
+  // Camada de notícias (opcional, independente do modo dinâmico técnico).
+  if (appSettings.newsTilt) {
+    const nf = newsSentiment.fatores();
+    // Combina multiplicando, depois faz CLAMP ao teto técnico de 1.0: o viés
+    // positivo das notícias só pode RECUPERAR a exposição que o regime apertou,
+    // nunca ultrapassar 1.0 (o teto do utilizador). O viés negativo aperta livre.
+    base = {
+      posicoes: Math.min(1.0, +(base.posicoes * nf.posicoes).toFixed(3)),
+      valor:    Math.min(1.0, +(base.valor    * nf.valor).toFixed(3)),
+      confExtra: base.confExtra + nf.confExtra,
+      regime: base.regime,
+      newsBias: nf.bias, newsLabel: nf.label,
+    };
   }
+  return base;
 }
 
 // Aplica o fator de exposição a um limite de Nº de posições (arredonda para baixo,
@@ -973,6 +1005,17 @@ async function tick() {
       fb.saveSetting("server", "marketSignals", sigsAfter).catch(() => {});
     }
 
+    // Atualizar sentiment de notícias (só ajusta exposição, nunca SL/TP). Lê o
+    // feed que a app escreve em settings/newsFeed (manchetes ou override manual).
+    if (appSettings.newsTilt) {
+      const before = JSON.stringify(newsSentiment.getState());
+      await newsSentiment.refresh(newsFeed || {});
+      const after = newsSentiment.getState();
+      if (JSON.stringify(after) !== before) {
+        fb.saveSetting("server", "newsSentiment", after).catch(() => {});
+      }
+    }
+
     // Registar histórico
     Object.entries(currentPrices).forEach(([id, d]) => {
       if (d?.price) recordPrice(id, d.price);
@@ -1141,6 +1184,8 @@ async function tick() {
       // AI-Brain a operar por indicadores técnicos porque o Groq está em baixo.
       aiBrainFallback: !!appSettings.aiBrain && !aiSignals.getGroqHealth().ok,
       scaleOutTP:   !!appSettings.scaleOutTP,
+      regimeDinamico: !!appSettings.regimeDinamico,
+      newsTilt:     !!appSettings.newsTilt,
       paused:       botPaused,
     };
     const featuresJson = JSON.stringify(features);
@@ -1181,6 +1226,9 @@ async function tick() {
           fatorValor:    rf.valor,      // ex.: 0.6 = 60% do valor por trade
           confExtra:     rf.confExtra,  // pontos extra de confiança exigida
         },
+        // Sentiment de notícias (só ajusta exposição, nunca SL/TP). A app mostra
+        // o clima atual e a justificação para o utilizador perceber o ajuste.
+        newsSentiment: appSettings.newsTilt ? newsSentiment.getState() : { bias: 0, label: "desligado", rationale: "", source: "off" },
       });
       lastHeartbeatAt  = now;
       lastFeaturesJson = featuresJson;
@@ -1411,6 +1459,8 @@ async function init() {
       scaleOutPct:      val.scaleOutPct ?? 50,     // % a vender no TP parcial
       catAjuste:        (val.catAjuste && typeof val.catAjuste === "object") ? val.catAjuste : appSettings.catAjuste,
       perOrigem:        (val.perOrigem && typeof val.perOrigem === "object") ? val.perOrigem : appSettings.perOrigem,
+      regimeDinamico:   val.regimeDinamico ?? false,
+      newsTilt:         val.newsTilt ?? false,
     };
     aiSignals.setRefreshMinutes(appSettings.aiSignalsMin);
     logger.info(`Definições [${SETTINGS_DOC}]: máx ${appSettings.maxEstrategias} | rotação ${appSettings.rotacaoAtiva ? "ON" : "OFF"} | AI Brain ${appSettings.aiBrain ? `ON@${appSettings.aiBrainConfianca}%` : "OFF"} | Trailing ${appSettings.trailingStop ? `ON@${appSettings.trailingStopPct}%` : "OFF"} | teto €${appSettings.maxValorTrade} | Sinais ${appSettings.aiSignalsMin}min`);
@@ -1434,6 +1484,16 @@ async function init() {
         logger.info(`Bot ${botPaused ? "PAUSADO ⏸ (sem novas entradas)" : "RETOMADO ▶ (entradas ativas)"}`);
         notify(botPaused ? "⏸ *Bot pausado* — sem novas entradas. SL/TP continuam ativos." : "▶ *Bot retomado* — entradas ativas.").catch(() => {});
       }
+    }
+  });
+
+  // Subscrever feed de notícias (escrito pela app em settings/newsFeed). Pode ter
+  // { headlines:[...] } para a IA classificar, ou { manualBias:0.5, manualLabel }
+  // para override manual do clima. Só é usado se newsTilt estiver ligado.
+  fb.watchSetting("newsFeed", (val) => {
+    if (val && typeof val === "object") {
+      newsFeed = val;
+      logger.info(`📰 Feed de notícias atualizado: ${Array.isArray(val.headlines) ? val.headlines.length + " manchetes" : (val.manualBias != null ? "override manual" : "vazio")}`);
     }
   });
 
