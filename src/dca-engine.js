@@ -1,25 +1,25 @@
 // src/dca-engine.js
 // ─────────────────────────────────────────────────────────────────────────────
-// MOTOR DCA (Dollar-Cost Averaging) — o núcleo PASSIVO do bot.
+// MOTOR DCA (Dollar-Cost Averaging) — núcleo PASSIVO, com MÚLTIPLOS PLANOS.
 //
-// Filosofia: não tentar adivinhar o mercado. Comprar uma quantia fixa da carteira
-// em intervalos regulares, e segurar. Os dados (backtester) provaram que isto bate
-// qualquer estratégia ativa de indicadores nestes ativos. É o motor "férias":
-// definir e esquecer.
+// Modelo (definido pelo utilizador na app):
+//   • dcaValorMensal: o "bolo" que invistes por período (ex.: 100€/mês).
+//   • dcaPlanos: lista de planos, cada um com objetivo próprio. Ex.:
+//       [{ id, nome:"Férias", carteira:[{id,peso}], alocacao:{tipo:"pct",valor:30},
+//          frequencia:"mensal", proximaCompra, dataInicio, reequilibrar }]
+//   • Fatia AI Trade: o que defines para o trading ativo fica como reserva de
+//     capital (AI Brain + manuais). Não compra nada sozinho — é só o teto.
 //
-// O que faz:
-//   1. COMPRA PERIÓDICA: na frequência definida (semanal/quinzenal/mensal), compra
-//      €dcaValorPeriodico repartido pela carteira-alvo (pesos do utilizador).
-//   2. REEQUILÍBRIO: quando os pesos reais derivam do alvo além de dcaDerivaPct,
-//      vende um pouco do que subiu e compra do que ficou para trás.
+// Repartição FLEXÍVEL: cada plano aloca por PERCENTAGEM do bolo, ou por VALOR
+// fixo (€). Podes misturar. Se a soma de % exceder o restante, são reduzidos
+// proporcionalmente.
 //
-// Diferenças-chave face ao trading ativo:
-//   • Posições DCA são HOLD — NÃO têm SL/TP, NUNCA são fechadas pela lógica de
-//     stop. São marcadas com stratId "dca" para o motor de SL/TP as ignorar.
-//   • Usa uma FATIA SEPARADA do capital (dcaPctCapital). O AI Trade nunca lhe toca.
-//   • Corre sempre que dcaAtivo estiver ligado, independentemente do AI Trade.
+// Cada plano tem a SUA carteira, histórico e dataInicio (para medir desempenho).
+// Posições marcadas com stratId "dca" e planId — separadas do trading ativo e
+// nunca fechadas pela lógica de SL/TP.
 //
-// O bot é a autoridade única: isto corre no servidor 24/7. A app só define o plano.
+// Retrocompat: se existir o formato antigo (dcaCarteira/dcaValorPeriodico), é
+// convertido para um plano único "Principal" automaticamente.
 // ─────────────────────────────────────────────────────────────────────────────
 
 const logger = require("./logger");
@@ -30,137 +30,156 @@ const FREQ_MS = {
   mensal:    30 * 24 * 60 * 60 * 1000,
 };
 
-// Estado interno mínimo (o resto vem das settings e das posições reais).
 let lastRebalanceCheck = 0;
-const REBALANCE_CHECK_MS = 6 * 60 * 60 * 1000; // verifica deriva a cada 6h
+const REBALANCE_CHECK_MS = 6 * 60 * 60 * 1000;
 
-// deps injetadas pelo sim-engine para reusar a sua infra (broker, fb, prices…).
-//   ctx.settings()      → appSettings atual
-//   ctx.dcaPositions()  → posições DCA abertas [{assetId, units, amount, entryPrice}]
-//   ctx.dcaBalance()    → saldo disponível na fatia DCA (€)
-//   ctx.priceOf(id)     → preço real fresco ou null
-//   ctx.buyDCA(id, eur) → executa compra DCA (HOLD, sem SL/TP) e devolve fill
-//   ctx.sellDCA(id, eur)→ vende parte de uma posição DCA (para reequilíbrio)
-//   ctx.now()           → Date.now() (testável)
 let ctx = null;
 function init(context) { ctx = context; }
 
-// ── Compra periódica ──────────────────────────────────────────────────────────
-async function tickCompraPeriodica() {
+// ── Normaliza a config para a lista de planos (com retrocompat) ───────────────
+function getPlanos() {
   const s = ctx.settings();
-  if (!s.dcaAtivo) return;
-  const carteira = Array.isArray(s.dcaCarteira) ? s.dcaCarteira.filter(c => c.peso > 0) : [];
-  if (!carteira.length) return; // sem plano configurado
-
-  const agora = ctx.now();
-  const intervalo = FREQ_MS[s.dcaFrequencia] || FREQ_MS.semanal;
-  const proxima = s.dcaProximaCompra || 0;
-
-  // Primeira vez (sem agendamento): agenda para já e compra agora.
-  if (!proxima) {
-    await executarCompraPeriodica(s, carteira);
-    await ctx.agendarProxima(agora + intervalo);
-    return;
+  if (Array.isArray(s.dcaPlanos) && s.dcaPlanos.length) return s.dcaPlanos;
+  if (Array.isArray(s.dcaCarteira) && s.dcaCarteira.length) {
+    return [{
+      id: "principal", nome: "Principal",
+      carteira: s.dcaCarteira,
+      alocacao: { tipo: "valor", valor: Number(s.dcaValorPeriodico) || 50 },
+      frequencia: s.dcaFrequencia || "mensal",
+      proximaCompra: s.dcaProximaCompra || null,
+      dataInicio: s.dcaDataInicio || null,
+      reequilibrar: s.dcaReequilibrar !== false,
+    }];
   }
-  // Ainda não chegou a hora.
-  if (agora < proxima) return;
-
-  await executarCompraPeriodica(s, carteira);
-  // Agenda a próxima (a partir de agora, para não acumular atrasos).
-  await ctx.agendarProxima(agora + intervalo);
+  return [];
 }
 
-async function executarCompraPeriodica(s, carteira) {
-  const valorTotal = Number(s.dcaValorPeriodico) || 0;
-  if (valorTotal <= 0) return;
+// Quanto € cada plano recebe deste período, dado o bolo mensal.
+function repartir(planos, bolo) {
+  const fixos = planos.filter(p => p.alocacao && p.alocacao.tipo === "valor");
+  const pcts  = planos.filter(p => p.alocacao && p.alocacao.tipo === "pct");
+  const totalFixo = fixos.reduce((a, p) => a + (Number(p.alocacao.valor) || 0), 0);
+  const restante = Math.max(0, bolo - totalFixo);
+  const somaPct = pcts.reduce((a, p) => a + (Number(p.alocacao.valor) || 0), 0);
+  const out = {};
+  for (const p of fixos) out[p.id] = Math.min(Number(p.alocacao.valor) || 0, bolo);
+  for (const p of pcts) {
+    const ideal = bolo * (Number(p.alocacao.valor) || 0) / 100;
+    out[p.id] = somaPct > 0 ? Math.min(ideal, restante * (Number(p.alocacao.valor) / somaPct)) : 0;
+  }
+  return out;
+}
 
+// ── Compra periódica (por plano) ──────────────────────────────────────────────
+async function tickCompras() {
+  const s = ctx.settings();
+  if (!s.dcaAtivo) return;
+  const planos = getPlanos();
+  if (!planos.length) return;
+  const bolo = Number(s.dcaValorMensal) || 0;
+  if (bolo <= 0) return;
+
+  const agora = ctx.now();
+  const reparticao = repartir(planos, bolo);
+
+  for (const plano of planos) {
+    const carteira = Array.isArray(plano.carteira) ? plano.carteira.filter(c => c.peso > 0) : [];
+    if (!carteira.length) continue;
+
+    const intervalo = FREQ_MS[plano.frequencia] || FREQ_MS.mensal;
+    const proxima = plano.proximaCompra || 0;
+    if (proxima && agora < proxima) continue;
+
+    const valorPlano = +(reparticao[plano.id] || 0).toFixed(2);
+    if (valorPlano >= 1) {
+      await executarCompraPlano(plano, carteira, valorPlano);
+    }
+    await ctx.agendarPlano(plano.id, agora + intervalo, plano.dataInicio || agora);
+  }
+}
+
+async function executarCompraPlano(plano, carteira, valorPlano) {
   const saldo = ctx.dcaBalance();
-  if (saldo < valorTotal) {
-    logger.warn(`DCA: saldo da fatia (€${saldo.toFixed(2)}) < valor da compra (€${valorTotal}). Compra adiada.`);
+  if (saldo < valorPlano) {
+    logger.warn(`DCA[${plano.nome}]: saldo (€${saldo.toFixed(2)}) < compra (€${valorPlano}). Adiada.`);
     return;
   }
-
   const somaPesos = carteira.reduce((a, c) => a + c.peso, 0) || 100;
-  logger.info(`📈 DCA: compra periódica de €${valorTotal} repartida por ${carteira.length} ativos`);
+  logger.info(`📈 DCA[${plano.nome}]: compra de €${valorPlano} por ${carteira.length} ativos`);
 
   for (const item of carteira) {
-    const fatia = +(valorTotal * (item.peso / somaPesos)).toFixed(2);
-    if (fatia < 1) continue; // ignora fatias minúsculas
+    const fatia = +(valorPlano * (item.peso / somaPesos)).toFixed(2);
+    if (fatia < 1) continue;
     const px = ctx.priceOf(item.id);
-    if (px == null) { logger.warn(`DCA: sem preço fresco para ${item.id} — fatia saltada`); continue; }
+    if (px == null) { logger.warn(`DCA[${plano.nome}]: sem preço para ${item.id} — saltado`); continue; }
     try {
-      await ctx.buyDCA(item.id, fatia);
-      logger.info(`  ✓ DCA comprou €${fatia} de ${item.id}`);
+      await ctx.buyDCA(item.id, fatia, plano.id, plano.nome);
+      logger.info(`  ✓ ${plano.nome}: €${fatia} de ${item.id}`);
     } catch (e) {
-      logger.warn(`  ✗ DCA falhou compra de ${item.id}: ${e.message}`);
+      logger.warn(`  ✗ ${plano.nome} ${item.id}: ${e.message}`);
     }
   }
 }
 
-// ── Reequilíbrio ──────────────────────────────────────────────────────────────
-// Compara pesos reais (valor de mercado de cada posição DCA) com os pesos-alvo.
-// Se algum ativo derivar além de dcaDerivaPct, ajusta: vende o excedentário,
-// compra o deficitário, voltando ao alvo. "Vender caro, comprar barato" automático.
+// ── Reequilíbrio (por plano) ──────────────────────────────────────────────────
 async function tickReequilibrio() {
   const s = ctx.settings();
-  if (!s.dcaAtivo || !s.dcaReequilibrar) return;
+  if (!s.dcaAtivo) return;
   const agora = ctx.now();
   if (agora - lastRebalanceCheck < REBALANCE_CHECK_MS) return;
   lastRebalanceCheck = agora;
 
-  const carteira = Array.isArray(s.dcaCarteira) ? s.dcaCarteira.filter(c => c.peso > 0) : [];
-  if (carteira.length < 2) return;
+  for (const plano of getPlanos()) {
+    if (plano.reequilibrar === false) continue;
+    const carteira = Array.isArray(plano.carteira) ? plano.carteira.filter(c => c.peso > 0) : [];
+    if (carteira.length < 2) continue;
 
-  const posicoes = ctx.dcaPositions();
-  if (!posicoes.length) return;
+    const posicoes = ctx.dcaPositions().filter(p => p.planId === plano.id);
+    if (!posicoes.length) continue;
 
-  // Valor de mercado atual por ativo
-  const valorPorAtivo = {};
-  let valorTotal = 0;
-  for (const p of posicoes) {
-    const px = ctx.priceOf(p.assetId);
-    if (px == null) return; // sem preço fresco → não arrisca reequilibrar
-    const v = p.units * px;
-    valorPorAtivo[p.assetId] = (valorPorAtivo[p.assetId] || 0) + v;
-    valorTotal += v;
-  }
-  if (valorTotal <= 0) return;
+    const valorPorAtivo = {};
+    let valorTotal = 0;
+    let semPreco = false;
+    for (const p of posicoes) {
+      const px = ctx.priceOf(p.assetId);
+      if (px == null) { semPreco = true; break; }
+      const v = p.units * px;
+      valorPorAtivo[p.assetId] = (valorPorAtivo[p.assetId] || 0) + v;
+      valorTotal += v;
+    }
+    if (semPreco || valorTotal <= 0) continue;
 
-  const somaPesos = carteira.reduce((a, c) => a + c.peso, 0) || 100;
-  const derivaMax = Number(s.dcaDerivaPct) || 5;
+    const somaPesos = carteira.reduce((a, c) => a + c.peso, 0) || 100;
+    const derivaMax = Number(s.dcaDerivaPct) || 5;
+    const ajustes = [];
+    for (const item of carteira) {
+      const alvo = (item.peso / somaPesos) * 100;
+      const real = ((valorPorAtivo[item.id] || 0) / valorTotal) * 100;
+      const deriva = real - alvo;
+      if (Math.abs(deriva) >= derivaMax) {
+        ajustes.push({ id: item.id, deriva: +deriva.toFixed(1), eur: +((deriva / 100) * valorTotal).toFixed(2) });
+      }
+    }
+    if (!ajustes.length) continue;
 
-  // Para cada ativo do alvo, calcula peso real vs alvo
-  const ajustes = [];
-  for (const item of carteira) {
-    const alvo = (item.peso / somaPesos) * 100;
-    const real = ((valorPorAtivo[item.id] || 0) / valorTotal) * 100;
-    const deriva = real - alvo;
-    if (Math.abs(deriva) >= derivaMax) {
-      const eurAjuste = +((deriva / 100) * valorTotal).toFixed(2); // >0 = vender, <0 = comprar
-      ajustes.push({ id: item.id, deriva: +deriva.toFixed(1), eur: eurAjuste });
+    logger.info(`⚖️ DCA[${plano.nome}] reequilíbrio: ${ajustes.length} ativos fora do alvo`);
+    for (const a of ajustes.filter(x => x.eur > 0)) {
+      try { await ctx.sellDCA(a.id, a.eur, plano.id); logger.info(`  ↓ ${plano.nome}: vendeu €${a.eur} de ${a.id}`); }
+      catch (e) { logger.warn(`  ✗ venda ${a.id}: ${e.message}`); }
+    }
+    for (const a of ajustes.filter(x => x.eur < 0)) {
+      const eur = Math.abs(a.eur);
+      if (ctx.dcaBalance() < eur) continue;
+      try { await ctx.buyDCA(a.id, eur, plano.id, plano.nome); logger.info(`  ↑ ${plano.nome}: comprou €${eur} de ${a.id}`); }
+      catch (e) { logger.warn(`  ✗ compra ${a.id}: ${e.message}`); }
     }
   }
-  if (!ajustes.length) return;
-
-  logger.info(`⚖️ DCA reequilíbrio: ${ajustes.length} ativos fora do alvo (deriva ≥ ${derivaMax}%)`);
-  // Primeiro vende os excedentários (liberta saldo), depois compra os deficitários.
-  for (const a of ajustes.filter(x => x.eur > 0)) {
-    try { await ctx.sellDCA(a.id, a.eur); logger.info(`  ↓ vendeu €${a.eur} de ${a.id} (estava +${a.deriva}%)`); }
-    catch (e) { logger.warn(`  ✗ venda reequilíbrio ${a.id}: ${e.message}`); }
-  }
-  for (const a of ajustes.filter(x => x.eur < 0)) {
-    const eur = Math.abs(a.eur);
-    if (ctx.dcaBalance() < eur) continue;
-    try { await ctx.buyDCA(a.id, eur); logger.info(`  ↑ comprou €${eur} de ${a.id} (estava ${a.deriva}%)`); }
-    catch (e) { logger.warn(`  ✗ compra reequilíbrio ${a.id}: ${e.message}`); }
-  }
 }
 
-// Chamado pelo loop principal do sim-engine a cada tick.
 async function tick() {
   if (!ctx) return;
-  try { await tickCompraPeriodica(); } catch (e) { logger.warn(`DCA compra periódica: ${e.message}`); }
-  try { await tickReequilibrio(); }    catch (e) { logger.warn(`DCA reequilíbrio: ${e.message}`); }
+  try { await tickCompras(); }       catch (e) { logger.warn(`DCA compras: ${e.message}`); }
+  try { await tickReequilibrio(); }  catch (e) { logger.warn(`DCA reequilíbrio: ${e.message}`); }
 }
 
-module.exports = { init, tick };
+module.exports = { init, tick, getPlanos, repartir };

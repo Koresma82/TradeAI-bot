@@ -134,6 +134,11 @@ let appSettings   = {
   dcaAtivo: true, aiTradeAtivo: false, dcaPctCapital: 80,
   // Controlo granular do trading ativo (null = herda aiTradeAtivo p/ retrocompat).
   aiEstrategias: false, aiManualAutonomo: false, aiDayTrading: false,
+  // ── DCA multi-plano ──
+  dcaValorMensal: 100,        // o "bolo" por período repartido pelos planos
+  dcaPlanos: [],              // [{ id, nome, carteira, alocacao, frequencia, ... }]
+  dcaAiTradePct: 20,          // % do capital reservado ao trading ativo
+  dcaAiTradeValor: 0,         // OU € fixo (>0 sobrepõe a %)
   dcaValorPeriodico: 50, dcaFrequencia: "semanal", dcaCarteira: [],
   dcaReequilibrar: true, dcaDerivaPct: 5, dcaProximaCompra: null,
 };
@@ -596,6 +601,12 @@ async function executeBuy(strategy, assetId, price, confianca) {
     logger.warn(`Saldo insuficiente: €${simBalance} < €${amount}`);
     return;
   }
+  // Teto da fatia AI Trade: o trading ativo não pode invadir o capital reservado
+  // aos planos DCA. Se a compra excede a reserva disponível, não abre.
+  if (aiTradeSaldoDisponivel() < amount) {
+    logger.warn(`Fatia AI Trade esgotada (€${aiTradeSaldoDisponivel().toFixed(2)} < €${amount}) — compra de estratégia ignorada para proteger o DCA`);
+    return;
+  }
   // Limite GLOBAL de posições abertas do TRADING ATIVO (todas as origens menos
   // DCA). As posições DCA são HOLD passivo com a sua própria fatia de capital —
   // não devem consumir o orçamento de posições do trading ativo, senão o DCA, ao
@@ -771,6 +782,10 @@ async function openDayTrade({ assetId, assetName, assetSym, price, amount, sl, t
   let amt = valDt != null ? valDt : amount;
   if (Number.isFinite(tetoDtCfg) && tetoDtCfg > 0) amt = Math.min(amt, tetoDtCfg);
   if (simBalance < amt) return false;
+  if (aiTradeSaldoDisponivel() < amt) {
+    logger.warn(`Fatia AI Trade esgotada — day-trade ${assetSym} ignorado (protege o DCA)`);
+    return false;
+  }
   const maxTotDt = Number(appSettings.maxPosicoesTotal);
   if (Number.isFinite(maxTotDt) && maxTotDt > 0 && Object.values(openPositions).filter(p => p.stratId !== "dca").length >= maxTotDt) {
     logger.warn(`Limite global de posições atingido — day-trade ${assetSym} ignorado`);
@@ -912,6 +927,10 @@ async function runAiBrain(currentPrices) {
       parseFloat(process.env.MAX_POSITION_EUR || "500")
     );
     if (simBalance < perTrade) continue;
+    if (aiTradeSaldoDisponivel() < perTrade) {
+      if (tickCount % 30 === 0) logger.info("Fatia AI Trade esgotada — Cérebro AI em pausa (protege o DCA)");
+      continue;
+    }
     if (totalInvested + perTrade > parseFloat(process.env.MAX_TOTAL_EUR || simCapital)) continue;
 
     const price = pd.price;
@@ -980,32 +999,57 @@ async function runAiBrain(currentPrices) {
 // As posições DCA são HOLD: sem SL/TP, marcadas com stratId "dca". A fatia de
 // capital DCA é separada — o trading ativo nunca lhe toca, e vice-versa.
 
-// Saldo disponível na fatia DCA = dcaPctCapital% do capital − já investido em DCA.
+// As posições DCA são HOLD: sem SL/TP, marcadas com stratId "dca" e planId.
+// No modelo multi-plano, o DCA usa o saldo disponível (limitado pelo total), e a
+// fatia AI Trade é definida pelo utilizador como reserva para o trading ativo.
+
 function dcaInvestido() {
   return Object.values(openPositions)
     .filter(p => p.stratId === "dca")
     .reduce((a, p) => a + (p.amount || 0), 0);
 }
+function aiTradeInvestido() {
+  return Object.values(openPositions)
+    .filter(p => p.stratId !== "dca")
+    .reduce((a, p) => a + (p.amount || 0), 0);
+}
+// Saldo que o DCA pode usar = o que sobra depois de reservar a fatia AI Trade.
+// A fatia AI Trade é dcaAiTradeValor (€ fixo) ou dcaAiTradePct (% do capital).
+function reservaAiTrade() {
+  if (Number(appSettings.dcaAiTradeValor) > 0) return Number(appSettings.dcaAiTradeValor);
+  const pct = Number(appSettings.dcaAiTradePct);
+  if (Number.isFinite(pct) && pct > 0) return (pct / 100) * simCapital;
+  // Retrocompat: se ainda houver dcaPctCapital, a reserva AI = 100 − dcaPctCapital.
+  const legacy = Number(appSettings.dcaPctCapital);
+  if (Number.isFinite(legacy) && legacy > 0) return ((100 - legacy) / 100) * simCapital;
+  return 0;
+}
 function dcaSaldoDisponivel() {
-  const pct = Number(appSettings.dcaPctCapital);
-  const fatia = (Number.isFinite(pct) && pct > 0 ? pct : 80) / 100 * simCapital;
-  return Math.max(0, +(Math.min(fatia, simBalance) - dcaInvestido()).toFixed(2));
+  const reserva = reservaAiTrade();
+  // O DCA pode usar tudo menos a reserva AI Trade (e nunca mais do que há).
+  return Math.max(0, +(Math.min(simBalance, simCapital - reserva) - 0).toFixed(2));
+}
+// Saldo que o trading ativo (AI Brain + manuais) pode usar = a sua reserva menos
+// o que já tem investido. Protege os planos DCA de serem invadidos.
+function aiTradeSaldoDisponivel() {
+  const reserva = reservaAiTrade();
+  return Math.max(0, +(Math.min(reserva, simBalance) - aiTradeInvestido()).toFixed(2));
 }
 function dcaPosicoes() {
   return Object.values(openPositions)
     .filter(p => p.stratId === "dca")
-    .map(p => ({ assetId: p.assetId, units: p.units, amount: p.amount, entryPrice: p.entryPrice, posId: p.id }));
+    .map(p => ({ assetId: p.assetId, units: p.units, amount: p.amount, entryPrice: p.entryPrice, posId: p.id, planId: p.planId || "principal" }));
 }
 
-async function buyDCA(assetId, eur) {
+async function buyDCA(assetId, eur, planId = "principal", planNome = "Principal") {
   if (!prices.isReal(assetId)) throw new Error("sem preço real fresco");
   const price = currentPrices[assetId]?.price;
   if (!price) throw new Error("sem preço atual");
   if (simBalance < eur) throw new Error(`saldo insuficiente (€${simBalance} < €${eur})`);
 
-  // Se já existe uma posição DCA neste ativo, ACUMULA (média de custo) em vez de
-  // abrir várias — é a essência do DCA: ir somando ao mesmo ativo ao longo do tempo.
-  const existente = Object.values(openPositions).find(p => p.stratId === "dca" && p.assetId === assetId);
+  // Acumula na posição DCA do MESMO ativo E do MESMO plano (média de custo).
+  // Plano diferente do mesmo ativo = posição separada, para medir cada objetivo.
+  const existente = Object.values(openPositions).find(p => p.stratId === "dca" && p.assetId === assetId && (p.planId || "principal") === planId);
   const exec = await broker.buy({ assetId, amount: eur, price, sl: null, tp: null });
   const fillPrice = exec.fillPrice || price;
   const novasUnits = eur / fillPrice;
@@ -1015,15 +1059,15 @@ async function buyDCA(assetId, eur) {
     const totalAmount = (existente.amount || 0) + eur;
     existente.units = +totalUnits.toFixed(8);
     existente.amount = +totalAmount.toFixed(2);
-    existente.entryPrice = +(totalAmount / totalUnits).toFixed(6); // preço médio
+    existente.entryPrice = +(totalAmount / totalUnits).toFixed(6);
     await fb.saveTrade("server", existente);
   } else {
-    const posId = `${broker.isLive() ? "live" : "sim"}_dca_${Date.now()}_${assetId}`;
+    const posId = `${broker.isLive() ? "live" : "sim"}_dca_${planId}_${Date.now()}_${assetId}`;
     const position = {
       id: posId, assetId, assetName: assetId, assetSym: assetId.toUpperCase(),
       entryPrice: fillPrice, units: +novasUnits.toFixed(8), amount: +eur.toFixed(2),
       peak: fillPrice, sl: null, tp: null,
-      strategy: "DCA", stratId: "dca",
+      strategy: `DCA · ${planNome}`, stratId: "dca", planId, planNome,
       openedAt: new Date().toLocaleString("pt-PT"), openedTs: Date.now(),
       status: "ABERTA", mode: broker.isLive() ? "live" : "sim",
       brokerOrderId: exec.brokerOrderId || null, broker: exec.broker || null,
@@ -1038,9 +1082,9 @@ async function buyDCA(assetId, eur) {
   return { fillPrice, units: novasUnits };
 }
 
-async function sellDCA(assetId, eur) {
-  const pos = Object.values(openPositions).find(p => p.stratId === "dca" && p.assetId === assetId);
-  if (!pos) throw new Error("sem posição DCA neste ativo");
+async function sellDCA(assetId, eur, planId = "principal") {
+  const pos = Object.values(openPositions).find(p => p.stratId === "dca" && p.assetId === assetId && (p.planId || "principal") === planId);
+  if (!pos) throw new Error("sem posição DCA neste ativo/plano");
   if (!prices.isReal(assetId)) throw new Error("sem preço real fresco");
   const price = currentPrices[assetId]?.price;
   if (!price) throw new Error("sem preço atual");
@@ -1049,7 +1093,6 @@ async function sellDCA(assetId, eur) {
   const eurVender = Math.min(eur, valorAtual);
   const unitsVender = +(eurVender / price).toFixed(8);
   if (unitsVender <= 0 || unitsVender >= pos.units) {
-    // Vender tudo (ou quase) → fecha a posição inteira.
     const exec = await broker.sell({ assetId, units: pos.units, price, broker: pos.broker, hadBracket: false });
     const fill = exec.fillPrice || price;
     simBalance = +(simBalance + pos.units * fill).toFixed(2);
@@ -1059,7 +1102,6 @@ async function sellDCA(assetId, eur) {
     await fb.saveBalance("server", simBalance);
     return;
   }
-  // Venda parcial
   const exec = await broker.sell({ assetId, units: unitsVender, price, broker: pos.broker, hadBracket: false });
   const fill = exec.fillPrice || price;
   pos.units = +(pos.units - unitsVender).toFixed(8);
@@ -1079,9 +1121,23 @@ function initDCA() {
     priceOf:      (id) => (prices.isReal(id) ? (currentPrices[id]?.price ?? null) : null),
     buyDCA, sellDCA,
     now: () => Date.now(),
-    agendarProxima: (ts) => fb.saveSetting("server", "dcaSchedule", { dcaProximaCompra: ts }).then(() => {
-      appSettings.dcaProximaCompra = ts;
-    }).catch(() => {}),
+    // Agenda a próxima compra de UM plano e regista a sua data de início.
+    // Atualiza o plano dentro de appSettings.dcaPlanos e persiste em settings/dcaSchedule.
+    agendarPlano: (planId, proximaTs, dataInicio) => {
+      const planos = Array.isArray(appSettings.dcaPlanos) ? appSettings.dcaPlanos : [];
+      const p = planos.find(x => x.id === planId);
+      if (p) { p.proximaCompra = proximaTs; if (!p.dataInicio) p.dataInicio = dataInicio; }
+      // Retrocompat: plano único antigo
+      if (planId === "principal" && !planos.length) {
+        appSettings.dcaProximaCompra = proximaTs;
+        if (!appSettings.dcaDataInicio) appSettings.dcaDataInicio = dataInicio;
+      }
+      return fb.saveSetting("server", "dcaSchedule", {
+        dcaPlanosSchedule: planos.map(x => ({ id: x.id, proximaCompra: x.proximaCompra, dataInicio: x.dataInicio })),
+        dcaProximaCompra: appSettings.dcaProximaCompra ?? null,
+        dcaDataInicio: appSettings.dcaDataInicio ?? null,
+      }).catch(() => {});
+    },
   });
 }
 
@@ -1627,6 +1683,12 @@ async function init() {
       dcaReequilibrar:  val.dcaReequilibrar ?? true,
       dcaDerivaPct:     Number(val.dcaDerivaPct) || 5,
       dcaProximaCompra: val.dcaProximaCompra ?? appSettings.dcaProximaCompra ?? null,
+      // ── DCA multi-plano ──
+      dcaValorMensal:   Number(val.dcaValorMensal) || 100,
+      dcaPlanos:        Array.isArray(val.dcaPlanos) ? val.dcaPlanos : [],
+      dcaAiTradePct:    val.dcaAiTradePct != null ? Number(val.dcaAiTradePct) : 20,
+      dcaAiTradeValor:  Number(val.dcaAiTradeValor) || 0,
+      dcaDataInicio:    val.dcaDataInicio ?? appSettings.dcaDataInicio ?? null,
     };
     aiSignals.setRefreshMinutes(appSettings.aiSignalsMin);
     logger.info(`Definições [${SETTINGS_DOC}]: máx ${appSettings.maxEstrategias} | rotação ${appSettings.rotacaoAtiva ? "ON" : "OFF"} | AI Brain ${appSettings.aiBrain ? `ON@${appSettings.aiBrainConfianca}%` : "OFF"} | Trailing ${appSettings.trailingStop ? `ON@${appSettings.trailingStopPct}%` : "OFF"} | teto €${appSettings.maxValorTrade} | Sinais ${appSettings.aiSignalsMin}min`);
