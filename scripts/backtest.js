@@ -257,6 +257,32 @@ async function fetchBinance(symbol, dias = 365) {
   return rows.map(k => ({ t: new Date(k[0]).toISOString().slice(0, 10), c: parseFloat(k[4]) }));
 }
 
+// Yahoo Finance — fonte alternativa robusta (JSON, sem key). Símbolos: SPY, GC=F, EURUSD=X…
+async function fetchYahoo(symbol, dias = 365) {
+  const range = dias <= 365 ? "1y" : dias <= 730 ? "2y" : "5y";
+  const url = `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(symbol)}?range=${range}&interval=1d`;
+  const r = await fetch(url, { headers: { "User-Agent": "Mozilla/5.0" } });
+  if (!r.ok) throw new Error(`Yahoo HTTP ${r.status} para ${symbol}`);
+  const j = await r.json();
+  const res = j?.chart?.result?.[0];
+  if (!res) throw new Error(`Yahoo sem resultado p/ ${symbol}`);
+  const ts = res.timestamp || [];
+  const closes = res.indicators?.quote?.[0]?.close || [];
+  const candles = ts.map((t, i) => ({
+    t: new Date(t * 1000).toISOString().slice(0, 10),
+    c: closes[i],
+  })).filter(c => c.c != null && !isNaN(c.c));
+  if (!candles.length) throw new Error(`Yahoo sem candles p/ ${symbol}`);
+  return candles.slice(-dias);
+}
+
+// Símbolos Yahoo por id (fallback quando o Stooq falha).
+const YAHOO_MAP = {
+  spy: "SPY", qqq: "QQQ", gld: "GLD", iwm: "IWM", tlt: "TLT", xle: "XLE",
+  wti: "CL=F", gold: "GC=F", silver: "SI=F",
+  eurusd: "EURUSD=X", gbpusd: "GBPUSD=X", usdjpy: "JPY=X",
+};
+
 const FETCH_MAP = {
   btc: ["BTCUSDT", "Crypto"], eth: ["ETHUSDT", "Crypto"], sol: ["SOLUSDT", "Crypto"],
   xrp: ["XRPUSDT", "Crypto"], ada: ["ADAUSDT", "Crypto"], bnb: ["BNBUSDT", "Crypto"],
@@ -277,17 +303,25 @@ const STOOQ_MAP = {
 
 // Stooq devolve CSV: Date,Open,High,Low,Close,Volume. Usamos só Date + Close.
 async function fetchStooq(symbol, dias = 365) {
-  const url = `https://stooq.com/q/d/l/?s=${symbol}&i=d`;
-  const r = await fetch(url);
-  if (!r.ok) throw new Error(`Stooq ${r.status} para ${symbol}`);
+  // Intervalo de datas explícito — o Stooq é mais fiável assim e evita limites.
+  const hoje = new Date();
+  const ini = new Date(hoje); ini.setDate(ini.getDate() - dias - 30); // margem
+  const fmt = d => d.toISOString().slice(0, 10).replace(/-/g, "");
+  const url = `https://stooq.com/q/d/l/?s=${symbol}&d1=${fmt(ini)}&d2=${fmt(hoje)}&i=d`;
+  const r = await fetch(url, { headers: { "User-Agent": "Mozilla/5.0" } });
+  if (!r.ok) throw new Error(`Stooq HTTP ${r.status} para ${symbol}`);
   const csv = await r.text();
-  if (!csv || csv.startsWith("<") || !csv.includes(",")) throw new Error(`Stooq sem dados para ${symbol}`);
-  const linhas = csv.trim().split("\n").slice(1); // tira header
+  // Diagnóstico: o Stooq devolve texto de erro em vez de CSV quando há limite/símbolo errado.
+  const head = csv.slice(0, 60).replace(/\n/g, " ");
+  if (!csv || !/^Date,/i.test(csv.trim())) {
+    throw new Error(`Stooq resposta inesperada p/ ${symbol}: "${head}"`);
+  }
+  const linhas = csv.trim().split("\n").slice(1);
   const candles = linhas.map(l => {
     const cols = l.split(",");
     return { t: cols[0], c: parseFloat(cols[4]) };
   }).filter(c => c.t && !isNaN(c.c));
-  // Stooq dá histórico longo; cortamos aos últimos `dias`.
+  if (!candles.length) throw new Error(`Stooq CSV vazio p/ ${symbol}`);
   return candles.slice(-dias);
 }
 
@@ -297,16 +331,28 @@ async function carregarFetch(ids, dias) {
     const key = id.toLowerCase();
     const crypto = FETCH_MAP[key];
     const stooq  = STOOQ_MAP[key];
+    const yahoo  = YAHOO_MAP[key];
     try {
       let candles, cat;
       if (crypto) {
         candles = await fetchBinance(crypto[0], dias); cat = crypto[1];
-      } else if (stooq) {
-        candles = await fetchStooq(stooq[0], dias); cat = stooq[1];
+      } else if (stooq || yahoo) {
+        cat = stooq ? stooq[1]
+              : (key === "eurusd" || key === "gbpusd" || key === "usdjpy") ? "Forex"
+              : (key === "wti" || key === "gold" || key === "silver") ? "Commodity" : "ETF";
+        // Tenta Stooq primeiro; se falhar, cai para o Yahoo (mais robusto em datacenter).
+        try {
+          if (!stooq) throw new Error("sem símbolo stooq");
+          candles = await fetchStooq(stooq[0], dias);
+        } catch (eStooq) {
+          if (!yahoo) throw eStooq;
+          console.log(`  … ${id}: Stooq falhou (${eStooq.message.slice(0,40)}), a tentar Yahoo`);
+          candles = await fetchYahoo(yahoo, dias);
+        }
       } else {
-        console.log(`  ⚠ ${id}: sem fonte conhecida (crypto via Binance, resto via Stooq)`); continue;
+        console.log(`  ⚠ ${id}: sem fonte conhecida`); continue;
       }
-      if (!candles.length) { console.log(`  ✗ ${id}: 0 candles devolvidos`); continue; }
+      if (!candles.length) { console.log(`  ✗ ${id}: 0 candles`); continue; }
       out.push({ id, cat, candles });
       console.log(`  ✓ ${id} (${cat}): ${candles.length} candles (${candles[0].t} → ${candles[candles.length-1].t})`);
     } catch (e) { console.log(`  ✗ ${id}: ${e.message}`); }
