@@ -264,15 +264,51 @@ const FETCH_MAP = {
   link: ["LINKUSDT", "Crypto"],
 };
 
+// Ativos não-crypto via Stooq (CSV diário, sem API key). Mapeia id → [símbolo stooq, categoria].
+const STOOQ_MAP = {
+  // ETFs (.us)
+  spy: ["spy.us", "ETF"], qqq: ["qqq.us", "ETF"], gld: ["gld.us", "ETF"],
+  iwm: ["iwm.us", "ETF"], tlt: ["tlt.us", "ETF"], xle: ["xle.us", "ETF"],
+  // Commodities (futuros)
+  wti: ["cl.f", "Commodity"], gold: ["gc.f", "Commodity"], silver: ["si.f", "Commodity"],
+  // Forex
+  eurusd: ["eurusd", "Forex"], gbpusd: ["gbpusd", "Forex"], usdjpy: ["usdjpy", "Forex"],
+};
+
+// Stooq devolve CSV: Date,Open,High,Low,Close,Volume. Usamos só Date + Close.
+async function fetchStooq(symbol, dias = 365) {
+  const url = `https://stooq.com/q/d/l/?s=${symbol}&i=d`;
+  const r = await fetch(url);
+  if (!r.ok) throw new Error(`Stooq ${r.status} para ${symbol}`);
+  const csv = await r.text();
+  if (!csv || csv.startsWith("<") || !csv.includes(",")) throw new Error(`Stooq sem dados para ${symbol}`);
+  const linhas = csv.trim().split("\n").slice(1); // tira header
+  const candles = linhas.map(l => {
+    const cols = l.split(",");
+    return { t: cols[0], c: parseFloat(cols[4]) };
+  }).filter(c => c.t && !isNaN(c.c));
+  // Stooq dá histórico longo; cortamos aos últimos `dias`.
+  return candles.slice(-dias);
+}
+
 async function carregarFetch(ids, dias) {
   const out = [];
   for (const id of ids) {
-    const m = FETCH_MAP[id.toLowerCase()];
-    if (!m) { console.log(`  ⚠ ${id}: sem fonte de fetch (só crypto via Binance por agora)`); continue; }
+    const key = id.toLowerCase();
+    const crypto = FETCH_MAP[key];
+    const stooq  = STOOQ_MAP[key];
     try {
-      const candles = await fetchBinance(m[0], dias);
-      out.push({ id, cat: m[1], candles });
-      console.log(`  ✓ ${id}: ${candles.length} candles (${candles[0].t} → ${candles[candles.length-1].t})`);
+      let candles, cat;
+      if (crypto) {
+        candles = await fetchBinance(crypto[0], dias); cat = crypto[1];
+      } else if (stooq) {
+        candles = await fetchStooq(stooq[0], dias); cat = stooq[1];
+      } else {
+        console.log(`  ⚠ ${id}: sem fonte conhecida (crypto via Binance, resto via Stooq)`); continue;
+      }
+      if (!candles.length) { console.log(`  ✗ ${id}: 0 candles devolvidos`); continue; }
+      out.push({ id, cat, candles });
+      console.log(`  ✓ ${id} (${cat}): ${candles.length} candles (${candles[0].t} → ${candles[candles.length-1].t})`);
     } catch (e) { console.log(`  ✗ ${id}: ${e.message}`); }
   }
   return out;
