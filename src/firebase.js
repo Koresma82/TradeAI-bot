@@ -133,6 +133,36 @@ async function deleteTrade(uid, id) {
   await userCol("trades").doc(id).delete();
 }
 
+// ── Limpeza total: recomeço de raiz (botão "Limpar tudo" nas Definições) ──────
+// Apaga TODOS os trades (abertos e fechados), TODOS os arquivos diários, stats e
+// logs, e repõe o saldo ao capital inicial. NÃO toca em estratégias nem settings
+// (o utilizador mantém a configuração; só os dados de trading são limpos).
+// Devolve um resumo do que apagou. Em batches para respeitar limites do Firestore.
+async function resetAllData(capitalInicial = 1000) {
+  const resumo = { trades: 0, archives: 0, stats: 0, logs: 0 };
+  const apagarColecao = async (col) => {
+    let total = 0;
+    while (true) {
+      const snap = await userCol(col).limit(400).get();
+      if (snap.empty) break;
+      const batch = db.batch();
+      snap.docs.forEach(d => batch.delete(d.ref));
+      await batch.commit();
+      total += snap.size;
+      if (snap.size < 400) break;
+    }
+    return total;
+  };
+  resumo.trades   = await apagarColecao("trades");
+  resumo.archives = await apagarColecao("archives");
+  resumo.stats    = await apagarColecao("stats");
+  resumo.logs     = await apagarColecao("logs");
+  // Repor saldo ao capital inicial.
+  await saveBalance(USER_UID, capitalInicial);
+  logger.info(`🧹 Reset total: ${resumo.trades} trades, ${resumo.archives} arquivos, ${resumo.stats} stats, ${resumo.logs} logs apagados. Saldo reposto a €${capitalInicial}.`);
+  return resumo;
+}
+
 async function saveStats(uid, stats) {
   const day = new Date().toISOString().split("T")[0];
   await userDoc("stats", day).set({
@@ -447,6 +477,7 @@ module.exports = {
   initFirebase,
   appendLog,
   deleteTrade,
+  resetAllData,
   checkDayRollover,
   watchStrategies,
   saveTrade,

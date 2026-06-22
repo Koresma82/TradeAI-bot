@@ -165,6 +165,26 @@ function simular(perfil, allSeries, logica = LOGICA) {
 }
 
 // ── Estatística da simulação ───────────────────────────────────────────────────
+// ── BENCHMARK: comprar e segurar (buy-and-hold) ───────────────────────────────
+// A pergunta honesta: a estratégia bate simplesmente comprar os ativos e segurar?
+// Num bull market, qualquer estratégia que compre ações ganha — mas se não bater
+// o buy-and-hold, mais vale comprar o ETF e não fazer nada (menos risco, menos
+// custos, menos complexidade). Calcula o retorno % de uma carteira igualmente
+// ponderada: divide o capital pelos N ativos, compra cada um no 1º dia, segura
+// até ao último. Devolve retorno total %, por ativo, e em €.
+function buyAndHold(allSeries, capital = CAPITAL) {
+  const porAtivo = allSeries.map(s => {
+    const c = s.candles.filter(x => x.c != null && !isNaN(x.c));
+    if (c.length < 2) return { id: s.id, ret: 0, ini: null, fim: null };
+    const ini = c[0].c, fim = c[c.length - 1].c;
+    return { id: s.id, cat: s.cat, ret: ((fim - ini) / ini) * 100, ini, fim };
+  });
+  // Carteira igualmente ponderada
+  const retCarteira = porAtivo.reduce((s, a) => s + a.ret, 0) / (porAtivo.length || 1);
+  const lucroEur = capital * (retCarteira / 100);
+  return { retCarteira, lucroEur, porAtivo };
+}
+
 function analisar(perfil, trades, abertasNoFim) {
   const n = trades.length;
   if (n === 0) {
@@ -419,6 +439,36 @@ async function carregarFetch(ids, dias) {
       console.log(`\n⚠ Mesmo a melhor lógica continua sem expectativa positiva clara neste histórico.`);
       console.log(`  Próximo passo: testar outros parâmetros (mom, smaLong) ou filtros de regime.`);
     }
+
+    // ── TESTE HONESTO: a estratégia bate o comprar-e-segurar? ──
+    const bh = buyAndHold(series, CAPITAL);
+    console.log("\n" + "═".repeat(79));
+    console.log("TESTE HONESTO — a estratégia bate simplesmente COMPRAR E SEGURAR?\n");
+    console.log(`  Comprar-e-segurar (carteira igual dos ${series.length} ativos): ${fmt(bh.retCarteira)}% no período`);
+    console.log(`    Por ativo:`);
+    bh.porAtivo.sort((a, b) => b.ret - a.ret).forEach(a => {
+      console.log(`      ${a.id.padEnd(8)} ${fmt(a.ret).padStart(7)}%`);
+    });
+    // Retorno da estratégia em % do CAPITAL REALMENTE EMPREGUE. A estratégia usa
+    // €VALOR por trade com até MAX_POS posições simultâneas, logo o capital máximo
+    // em risco é ~VALOR×MAX_POS — não o capital nominal. Comparar P&L contra esse
+    // valor dá a percentagem justa face ao buy-and-hold (que emprega todo o capital).
+    const capitalEmpregue = Math.min(CAPITAL, VALOR * MAX_POS);
+    const stratRetPct = (venc.pnlTotal / capitalEmpregue) * 100;
+    console.log(`\n  Estratégia vencedora (${vencedor} ${venc.perfil}): ${fmt(stratRetPct)}% sobre capital empregue (~€${capitalEmpregue})`);
+    console.log(`    ${venc.n} trades · P&L ${fmt(venc.pnlTotal)}€ · WR ${venc.winRate.toFixed(0)}% · max drawdown ${venc.maxDD.toFixed(0)}%`);
+    console.log("\n  " + "─".repeat(74));
+    if (stratRetPct > bh.retCarteira) {
+      console.log(`  ✅ A estratégia BATE o comprar-e-segurar (+${(stratRetPct - bh.retCarteira).toFixed(1)} pontos). Há edge real aqui.`);
+    } else {
+      console.log(`  ⚠ A estratégia NÃO bate o comprar-e-segurar (${(stratRetPct - bh.retCarteira).toFixed(1)} pontos abaixo).`);
+      console.log(`    Ou seja: com este capital terias ganho mais a comprar os ativos e não fazer nada,`);
+      console.log(`    com menos risco e menos custos. O "lucro" da estratégia é boleia do bull market,`);
+      console.log(`    não edge. ATENÇÃO: testa também numa janela de mercado em baixa (--dias=1000).`);
+    }
+    console.log("\n  Nota: comparação aproximada (estratégia usa €/trade fixo, buy-hold usa capital");
+    console.log("  total). O essencial é a ordem de grandeza — se a estratégia fica muito abaixo do");
+    console.log("  buy-hold num bull market, o edge é ilusório. Confirma sempre numa correção.");
   } else if (args.grid) {
     console.log("GRID — todos os perfis comparados nas MESMAS condições:\n");
     const resultados = Object.keys(PERFIS).map(p => simular(p, series));

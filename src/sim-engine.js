@@ -10,6 +10,7 @@ const indicators = require("./indicators");
 const stats   = require("./stats");
 const aiSignals = require("./ai-signals");
 const dayTrading = require("./day-trading");
+const dcaEngine = require("./dca-engine");
 const newsSentiment = require("./news-sentiment");
 const broker  = require("./broker");
 const { notify, queueOpen, tg } = require("./telegram");
@@ -129,6 +130,12 @@ let appSettings   = {
   // EXPOSIÇÃO (nº de posições, € por trade, confiança exigida) dentro dos tetos.
   // NUNCA mexe em SL/TP. Clima negativo aperta; clima positivo afrouxa até 1.0.
   newsTilt: false,
+  // ── DCA (núcleo passivo) — defaults; sobrepostos pelas settings da app ──
+  dcaAtivo: true, aiTradeAtivo: false, dcaPctCapital: 80,
+  // Controlo granular do trading ativo (null = herda aiTradeAtivo p/ retrocompat).
+  aiEstrategias: false, aiManualAutonomo: false, aiDayTrading: false,
+  dcaValorPeriodico: 50, dcaFrequencia: "semanal", dcaCarteira: [],
+  dcaReequilibrar: true, dcaDerivaPct: 5, dcaProximaCompra: null,
 };
 // Estado do regime de mercado (recalculado periodicamente, não a cada tick).
 let regimeAtual    = "neutro";   // "alta" | "neutro" | "baixa"
@@ -317,6 +324,11 @@ async function checkSLTP(currentPrices) {
   const flipConf   = appSettings.aiBrainConfianca || 78;
 
   for (const [posId, pos] of Object.entries(openPositions)) {
+    // Posições DCA são HOLD passivo — sem SL/TP, NUNCA fechadas por esta lógica.
+    // O motor DCA (dca-engine.js) é que as gere (compra/reequilíbrio). Saltar aqui
+    // é o que mantém o núcleo passivo intocado pelo trading ativo.
+    if (pos.stratId === "dca") continue;
+
     // Só geримос com preço REAL e fresco. Um preço "seed" (base estático) ou
     // stale não pode disparar SL/TP/AI-EXIT — senão comparávamos a entrada real
     // com um preço fantasma e fechávamos a posição ao valor errado.
@@ -584,11 +596,14 @@ async function executeBuy(strategy, assetId, price, confianca) {
     logger.warn(`Saldo insuficiente: €${simBalance} < €${amount}`);
     return;
   }
-  // Limite GLOBAL de posições abertas (todas as origens). Evita centenas de
-  // posições quando o saldo de paper é enorme ($100k).
+  // Limite GLOBAL de posições abertas do TRADING ATIVO (todas as origens menos
+  // DCA). As posições DCA são HOLD passivo com a sua própria fatia de capital —
+  // não devem consumir o orçamento de posições do trading ativo, senão o DCA, ao
+  // ir acumulando, bloquearia as entradas ativas.
   const maxTotal = Number(appSettings.maxPosicoesTotal);
-  if (Number.isFinite(maxTotal) && maxTotal > 0 && Object.keys(openPositions).length >= maxTotal) {
-    logger.warn(`Limite global de ${maxTotal} posições abertas atingido — compra ignorada`);
+  const ativasNaoDca = Object.values(openPositions).filter(p => p.stratId !== "dca").length;
+  if (Number.isFinite(maxTotal) && maxTotal > 0 && ativasNaoDca >= maxTotal) {
+    logger.warn(`Limite global de ${maxTotal} posições ativas atingido — compra ignorada`);
     return;
   }
   if (totalInvested + amount > parseFloat(process.env.MAX_TOTAL_EUR || simCapital)) {
@@ -602,7 +617,7 @@ async function executeBuy(strategy, assetId, price, confianca) {
   // limitePosicoes() reduz este teto em regime de baixa (modo dinâmico).
   const maxStrat = limitePosicoes(appSettings.maxEstrategias || 5);
   const stratPositions = Object.values(openPositions).filter(
-    p => p.stratId !== "manual" && p.stratId !== "daytrading" && p.stratId !== "ai-brain"
+    p => p.stratId !== "manual" && p.stratId !== "daytrading" && p.stratId !== "ai-brain" && p.stratId !== "dca"
   );
   if (stratPositions.length >= maxStrat) {
     if (!appSettings.rotacaoAtiva) {
@@ -757,7 +772,7 @@ async function openDayTrade({ assetId, assetName, assetSym, price, amount, sl, t
   if (Number.isFinite(tetoDtCfg) && tetoDtCfg > 0) amt = Math.min(amt, tetoDtCfg);
   if (simBalance < amt) return false;
   const maxTotDt = Number(appSettings.maxPosicoesTotal);
-  if (Number.isFinite(maxTotDt) && maxTotDt > 0 && Object.keys(openPositions).length >= maxTotDt) {
+  if (Number.isFinite(maxTotDt) && maxTotDt > 0 && Object.values(openPositions).filter(p => p.stratId !== "dca").length >= maxTotDt) {
     logger.warn(`Limite global de posições atingido — day-trade ${assetSym} ignorado`);
     return false;
   }
@@ -851,7 +866,7 @@ async function runAiBrain(currentPrices) {
     if (!sg || sg.sinal !== "COMPRAR" || (sg.confianca || 0) < minConf) continue;
     // Limite global de posições abertas (0/vazio = sem limite)
     const maxTotAi = Number(appSettings.maxPosicoesTotal);
-    if (Number.isFinite(maxTotAi) && maxTotAi > 0 && Object.keys(openPositions).length >= maxTotAi) break;
+    if (Number.isFinite(maxTotAi) && maxTotAi > 0 && Object.values(openPositions).filter(p => p.stratId !== "dca").length >= maxTotAi) break;
     if (!TRADEABLE.has(sg.id)) continue;
     // Não abrir em mercado fechado (evita flip-flop a preços congelados)
     if (!isMarketOpenFor(sg.id)) continue;
@@ -961,6 +976,115 @@ async function runAiBrain(currentPrices) {
   }
 }
 
+// ── Helpers DCA: compra/venda de posições HOLD (núcleo passivo) ───────────────
+// As posições DCA são HOLD: sem SL/TP, marcadas com stratId "dca". A fatia de
+// capital DCA é separada — o trading ativo nunca lhe toca, e vice-versa.
+
+// Saldo disponível na fatia DCA = dcaPctCapital% do capital − já investido em DCA.
+function dcaInvestido() {
+  return Object.values(openPositions)
+    .filter(p => p.stratId === "dca")
+    .reduce((a, p) => a + (p.amount || 0), 0);
+}
+function dcaSaldoDisponivel() {
+  const pct = Number(appSettings.dcaPctCapital);
+  const fatia = (Number.isFinite(pct) && pct > 0 ? pct : 80) / 100 * simCapital;
+  return Math.max(0, +(Math.min(fatia, simBalance) - dcaInvestido()).toFixed(2));
+}
+function dcaPosicoes() {
+  return Object.values(openPositions)
+    .filter(p => p.stratId === "dca")
+    .map(p => ({ assetId: p.assetId, units: p.units, amount: p.amount, entryPrice: p.entryPrice, posId: p.id }));
+}
+
+async function buyDCA(assetId, eur) {
+  if (!prices.isReal(assetId)) throw new Error("sem preço real fresco");
+  const price = currentPrices[assetId]?.price;
+  if (!price) throw new Error("sem preço atual");
+  if (simBalance < eur) throw new Error(`saldo insuficiente (€${simBalance} < €${eur})`);
+
+  // Se já existe uma posição DCA neste ativo, ACUMULA (média de custo) em vez de
+  // abrir várias — é a essência do DCA: ir somando ao mesmo ativo ao longo do tempo.
+  const existente = Object.values(openPositions).find(p => p.stratId === "dca" && p.assetId === assetId);
+  const exec = await broker.buy({ assetId, amount: eur, price, sl: null, tp: null });
+  const fillPrice = exec.fillPrice || price;
+  const novasUnits = eur / fillPrice;
+
+  if (existente) {
+    const totalUnits = existente.units + novasUnits;
+    const totalAmount = (existente.amount || 0) + eur;
+    existente.units = +totalUnits.toFixed(8);
+    existente.amount = +totalAmount.toFixed(2);
+    existente.entryPrice = +(totalAmount / totalUnits).toFixed(6); // preço médio
+    await fb.saveTrade("server", existente);
+  } else {
+    const posId = `${broker.isLive() ? "live" : "sim"}_dca_${Date.now()}_${assetId}`;
+    const position = {
+      id: posId, assetId, assetName: assetId, assetSym: assetId.toUpperCase(),
+      entryPrice: fillPrice, units: +novasUnits.toFixed(8), amount: +eur.toFixed(2),
+      peak: fillPrice, sl: null, tp: null,
+      strategy: "DCA", stratId: "dca",
+      openedAt: new Date().toLocaleString("pt-PT"), openedTs: Date.now(),
+      status: "ABERTA", mode: broker.isLive() ? "live" : "sim",
+      brokerOrderId: exec.brokerOrderId || null, broker: exec.broker || null,
+      brokerSymbol: exec.brokerSymbol || null, brokerSLTP: false,
+    };
+    openPositions[posId] = position;
+    await fb.saveTrade("server", position);
+  }
+  totalInvested += eur;
+  simBalance = +(simBalance - eur).toFixed(2);
+  await fb.saveBalance("server", simBalance);
+  return { fillPrice, units: novasUnits };
+}
+
+async function sellDCA(assetId, eur) {
+  const pos = Object.values(openPositions).find(p => p.stratId === "dca" && p.assetId === assetId);
+  if (!pos) throw new Error("sem posição DCA neste ativo");
+  if (!prices.isReal(assetId)) throw new Error("sem preço real fresco");
+  const price = currentPrices[assetId]?.price;
+  if (!price) throw new Error("sem preço atual");
+
+  const valorAtual = pos.units * price;
+  const eurVender = Math.min(eur, valorAtual);
+  const unitsVender = +(eurVender / price).toFixed(8);
+  if (unitsVender <= 0 || unitsVender >= pos.units) {
+    // Vender tudo (ou quase) → fecha a posição inteira.
+    const exec = await broker.sell({ assetId, units: pos.units, price, broker: pos.broker, hadBracket: false });
+    const fill = exec.fillPrice || price;
+    simBalance = +(simBalance + pos.units * fill).toFixed(2);
+    totalInvested = Math.max(0, totalInvested - (pos.amount || 0));
+    delete openPositions[pos.id];
+    await fb.deleteTrade?.("server", pos.id).catch?.(() => {});
+    await fb.saveBalance("server", simBalance);
+    return;
+  }
+  // Venda parcial
+  const exec = await broker.sell({ assetId, units: unitsVender, price, broker: pos.broker, hadBracket: false });
+  const fill = exec.fillPrice || price;
+  pos.units = +(pos.units - unitsVender).toFixed(8);
+  pos.amount = +(pos.amount - eurVender).toFixed(2);
+  simBalance = +(simBalance + unitsVender * fill).toFixed(2);
+  totalInvested = Math.max(0, totalInvested - eurVender);
+  await fb.saveTrade("server", pos);
+  await fb.saveBalance("server", simBalance);
+}
+
+// Inicializa o motor DCA com o contexto (deps) que precisa do sim-engine.
+function initDCA() {
+  dcaEngine.init({
+    settings:     () => appSettings,
+    dcaPositions: dcaPosicoes,
+    dcaBalance:   dcaSaldoDisponivel,
+    priceOf:      (id) => (prices.isReal(id) ? (currentPrices[id]?.price ?? null) : null),
+    buyDCA, sellDCA,
+    now: () => Date.now(),
+    agendarProxima: (ts) => fb.saveSetting("server", "dcaSchedule", { dcaProximaCompra: ts }).then(() => {
+      appSettings.dcaProximaCompra = ts;
+    }).catch(() => {}),
+  });
+}
+
 // ── Tick principal ────────────────────────────────────────────────────────────
 async function tick() {
   try {
@@ -997,12 +1121,18 @@ async function tick() {
       }).catch(() => {});
     }
 
-    // Atualizar sinais AI (intervalo configurável) e persistir para a app os mostrar
-    const sigsBefore = JSON.stringify(aiSignals.getSignals());
-    await aiSignals.refresh();
-    const sigsAfter = aiSignals.getSignals();
-    if (JSON.stringify(sigsAfter) !== sigsBefore && Object.keys(sigsAfter).length) {
-      fb.saveSetting("server", "marketSignals", sigsAfter).catch(() => {});
+    // Atualizar sinais AI (intervalo configurável) e persistir para a app os mostrar.
+    // SÓ quando alguma fonte que USA estes sinais está ligada (estratégias ou
+    // compras autónomas). Se tudo isso está off, gerá-los seria queimar tokens à toa.
+    const precisaSinais = (appSettings.aiEstrategias ?? appSettings.aiTradeAtivo)
+                       || (appSettings.aiManualAutonomo ?? appSettings.aiTradeAtivo);
+    if (precisaSinais) {
+      const sigsBefore = JSON.stringify(aiSignals.getSignals());
+      await aiSignals.refresh();
+      const sigsAfter = aiSignals.getSignals();
+      if (JSON.stringify(sigsAfter) !== sigsBefore && Object.keys(sigsAfter).length) {
+        fb.saveSetting("server", "marketSignals", sigsAfter).catch(() => {});
+      }
     }
 
     // Atualizar sentiment de notícias (só ajusta exposição, nunca SL/TP). Lê o
@@ -1027,15 +1157,34 @@ async function tick() {
     // 2b. Processar comandos manuais da app (compra/venda pedida pelo utilizador)
     await processCommands(currentPrices);
 
+    // 2c. MOTOR DCA (núcleo passivo) — corre SEMPRE que dcaAtivo, independente do
+    // botPaused (o DCA é o plano "férias", não deve parar em deploys) e do AI Trade.
+    // Faz as compras periódicas e o reequilíbrio. Usa a sua fatia de capital.
+    await dcaEngine.tick();
+
     // ── PAUSA: quando o bot está pausado (toggle na app, útil em deploys), NÃO
     // abre novas posições — mas continua a proteger as abertas (SL/TP acima já
     // correu) e a processar vendas/comandos. Pausar nunca desativa a proteção.
     if (botPaused) {
       if (tickCount % 10 === 0) logger.info("⏸ Bot PAUSADO — só gestão de posições abertas (SL/TP/vendas). Sem novas entradas.");
     } else {
+    // Controlo GRANULAR do trading ativo: cada fonte tem o seu interruptor.
+    // O DCA (acima) corre sempre. Estas só correm se a respetiva flag estiver on.
+    //   aiEstrategias    → bloco de estratégias (3)
+    //   aiManualAutonomo → Cérebro AI autónomo (3c)
+    //   aiDayTrading     → day-trade (3d)
+    // Compatibilidade: se aiTradeAtivo (o toggle antigo) estiver on, liga as três
+    // — assim configs antigas continuam a funcionar sem o utilizador reconfigurar.
+    const legacyOn = !!appSettings.aiTradeAtivo;
+    const onEstrat = appSettings.aiEstrategias ?? legacyOn;
+    const onManual = appSettings.aiManualAutonomo ?? legacyOn;
+    const onDay    = appSettings.aiDayTrading ?? legacyOn;
+    if (!onEstrat && !onManual && !onDay && tickCount % 30 === 0) {
+      logger.info("💤 Trading ativo todo desligado — só DCA passivo. Liga as fontes que quiseres na app.");
+    }
 
     // 3. Verificar sinais das estratégias
-    if (!dailyLossHit) {
+    if (onEstrat && !dailyLossHit) {
       for (const strategy of strategies) {
         if (!strategy.ativo) continue;
         for (const assetId of (strategy.ativos || [])) {
@@ -1096,12 +1245,13 @@ async function tick() {
       }
     }
 
-    // 3c. Cérebro AI autónomo — entra com base nos sinais de alta confiança
-    await runAiBrain(currentPrices);
+    // 3c. Cérebro AI autónomo — entra com base nos sinais de alta confiança.
+    // Só se as compras manuais autónomas estiverem ligadas (a IA compra sozinha).
+    if (onManual) await runAiBrain(currentPrices);
 
     // 3d. Day Trading 24/7 — scan com IA e abre posições rápidas (config vinda da app)
     // limitePosicoes() reduz o nº máximo de day-trades em regime de baixa.
-    await dayTrading.run(dtConfig, limitePosicoes(appSettings.maxDayTrading || 5), {
+    if (onDay) await dayTrading.run(dtConfig, limitePosicoes(appSettings.maxDayTrading || 5), {
       openDayTrade, countDayTrades, hasOpen,
     }).catch(err => logger.warn(`DayTrading run: ${err.message}`));
 
@@ -1270,6 +1420,9 @@ async function init() {
   logger.info("═══════════════════════════════════");
 
   stats.setBalance(simBalance);
+
+  // Inicializar o motor DCA (núcleo passivo) com o contexto do sim-engine.
+  initDCA();
 
   // ── Verificar a corretora (em modo paper/real) ──
   try {
@@ -1461,6 +1614,19 @@ async function init() {
       perOrigem:        (val.perOrigem && typeof val.perOrigem === "object") ? val.perOrigem : appSettings.perOrigem,
       regimeDinamico:   val.regimeDinamico ?? false,
       newsTilt:         val.newsTilt ?? false,
+      // ── DCA (núcleo passivo) ──
+      dcaAtivo:         val.dcaAtivo ?? true,
+      aiTradeAtivo:     val.aiTradeAtivo ?? false,
+      aiEstrategias:    val.aiEstrategias ?? null,
+      aiManualAutonomo: val.aiManualAutonomo ?? null,
+      aiDayTrading:     val.aiDayTrading ?? null,
+      dcaPctCapital:    Number(val.dcaPctCapital) || 80,
+      dcaValorPeriodico:Number(val.dcaValorPeriodico) || 50,
+      dcaFrequencia:    val.dcaFrequencia || "semanal",
+      dcaCarteira:      Array.isArray(val.dcaCarteira) ? val.dcaCarteira : [],
+      dcaReequilibrar:  val.dcaReequilibrar ?? true,
+      dcaDerivaPct:     Number(val.dcaDerivaPct) || 5,
+      dcaProximaCompra: val.dcaProximaCompra ?? appSettings.dcaProximaCompra ?? null,
     };
     aiSignals.setRefreshMinutes(appSettings.aiSignalsMin);
     logger.info(`Definições [${SETTINGS_DOC}]: máx ${appSettings.maxEstrategias} | rotação ${appSettings.rotacaoAtiva ? "ON" : "OFF"} | AI Brain ${appSettings.aiBrain ? `ON@${appSettings.aiBrainConfianca}%` : "OFF"} | Trailing ${appSettings.trailingStop ? `ON@${appSettings.trailingStopPct}%` : "OFF"} | teto €${appSettings.maxValorTrade} | Sinais ${appSettings.aiSignalsMin}min`);
@@ -1635,6 +1801,19 @@ async function processCommands(currentPrices) {
         const amount = Math.max(10, Number(cmd.amount) || 0);
         const r = await buyManual({ assetId: cmd.assetId, amount });
         await fb.markCommand(cmd.id, r.ok ? "FEITO" : "FALHOU", r.ok ? "comprado" : r.reason);
+      } else if (cmd.type === "RESET_ALL") {
+        // Recomeço de raiz: apaga trades/arquivos/stats/logs e repõe o saldo.
+        // Limpa também o estado em memória para o bot recomeçar limpo sem reiniciar.
+        const capital = Number(cmd.capital) || simCapital || 1000;
+        const resumo = await fb.resetAllData(capital);
+        openPositions = {};
+        totalInvested = 0;
+        simBalance = capital;
+        simCapital = capital;
+        appSettings.dcaProximaCompra = null; // reagenda DCA do zero
+        await fb.saveBalance("server", simBalance).catch(() => {});
+        await fb.markCommand(cmd.id, "FEITO", `apagados ${resumo.trades} trades, ${resumo.archives} arquivos`);
+        logger.info("🧹 Base de dados limpa por comando da app — recomeço de raiz.");
       } else {
         await fb.markCommand(cmd.id, "FALHOU", "comando inválido");
       }
