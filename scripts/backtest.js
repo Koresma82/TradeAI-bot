@@ -67,10 +67,11 @@ const MAX_POS   = parseInt(args.maxpos || "8", 10);  // posições simultâneas
 const COOLDOWN  = parseInt(args.cooldown || "3", 10); // dias de cooldown pós-perda
 const CAPITAL   = parseFloat(args.capital || "1000");
 const VALOR     = parseFloat(args.valor || "100");   // € por trade (sizing fixo)
+const LOGICA    = (args.logica || "queda").toLowerCase(); // "queda" (mean-rev) | "momentum"
 
 // ── Simula UM perfil sobre um conjunto de séries ───────────────────────────────
 // series: { id, cat, candles:[{t, c}] }
-function simular(perfil, allSeries) {
+function simular(perfil, allSeries, logica = LOGICA) {
   const cfg = PERFIS[perfil];
   if (!cfg) throw new Error(`perfil desconhecido: ${perfil}`);
 
@@ -131,11 +132,17 @@ function simular(perfil, allSeries) {
       const tpPct   = +(cfg.tp * fator).toFixed(2);
 
       // O MESMO buySignal do bot (com veto de tendência de baixa)
-      const sig = indicators.buySignal(serie, {
-        dropTrigger: dropAdj,
-        rsiOversold: cfg.rsi,
-        smaLong: 50,
-      });
+      // ou a variante MOMENTUM, conforme --logica.
+      let sig;
+      if (logica === "momentum") {
+        sig = indicators.momentumSignal(serie, { mom: 10, smaShort: 10, smaLong: 50, rsiLow: 50, rsiHigh: 72 });
+      } else {
+        sig = indicators.buySignal(serie, {
+          dropTrigger: dropAdj,
+          rsiOversold: cfg.rsi,
+          smaLong: 50,
+        });
+      }
       if (!sig.buy) continue;
 
       const px = priceAt[s.id][hoje];
@@ -298,10 +305,39 @@ async function carregarFetch(ids, dias) {
     return `${ds[0]} → ${ds[ds.length-1]}  (${new Set(ds).size} dias)`;
   })();
   console.log(`\nPeríodo: ${periodo}`);
+  console.log(`Lógica de entrada: ${LOGICA === "momentum" ? "MOMENTUM (comprar força)" : "QUEDA (mean-reversion — a atual do bot)"}`);
   console.log(`Parâmetros: custo ${CUSTO_PCT}%/trade · max ${MAX_POS} posições · cooldown ${COOLDOWN}d · €${VALOR}/trade · capital €${CAPITAL}\n`);
   console.log("─".repeat(79));
 
-  if (args.grid) {
+  if (args.compara) {
+    // Corre as DUAS lógicas (queda vs momentum) lado a lado, por perfil.
+    console.log("COMPARAÇÃO — QUEDA (mean-reversion) vs MOMENTUM (comprar força):\n");
+    const perfis = Object.keys(PERFIS);
+    console.log("  " + "perfil".padEnd(12) + " │ " + "QUEDA (exp €/t · WR · PF)".padEnd(30) + " │ MOMENTUM (exp €/t · WR · PF)");
+    console.log("  " + "─".repeat(74));
+    let bestMom = null, bestQueda = null;
+    for (const p of perfis) {
+      const rq = simular(p, series, "queda");
+      const rm = simular(p, series, "momentum");
+      const cell = (r) => r.n === 0 ? "sem trades".padEnd(28)
+        : `${fmt(r.expectancy).padStart(6)}€ · ${r.winRate.toFixed(0).padStart(2)}% · PF ${(r.profitFactor === Infinity ? "∞" : r.profitFactor.toFixed(2)).padStart(4)}`.padEnd(28);
+      console.log(`  ${p.padEnd(12)} │ ${cell(rq)} │ ${cell(rm)}`);
+      if (rq.n && (!bestQueda || rq.expectancy > bestQueda.expectancy)) bestQueda = { ...rq, perfil: p };
+      if (rm.n && (!bestMom   || rm.expectancy > bestMom.expectancy))   bestMom   = { ...rm, perfil: p };
+    }
+    console.log("\n" + "─".repeat(79));
+    if (bestQueda) console.log(`QUEDA    → melhor: ${bestQueda.perfil} (${fmt(bestQueda.expectancy)}€/trade, ${bestQueda.n} trades)`);
+    if (bestMom)   console.log(`MOMENTUM → melhor: ${bestMom.perfil} (${fmt(bestMom.expectancy)}€/trade, ${bestMom.n} trades)`);
+    const vencedor = (bestMom?.expectancy ?? -Infinity) > (bestQueda?.expectancy ?? -Infinity) ? "MOMENTUM" : "QUEDA";
+    const venc = vencedor === "MOMENTUM" ? bestMom : bestQueda;
+    console.log(`\n🏆 Lógica vencedora: ${vencedor} (${venc ? fmt(venc.expectancy) + "€/trade no perfil " + venc.perfil : "—"})`);
+    if (venc && venc.expectancy > 0.05) {
+      console.log(`\n✅ A lógica ${vencedor} tem expectativa POSITIVA — vale a pena implementá-la no bot.`);
+    } else {
+      console.log(`\n⚠ Mesmo a melhor lógica continua sem expectativa positiva clara neste histórico.`);
+      console.log(`  Próximo passo: testar outros parâmetros (mom, smaLong) ou filtros de regime.`);
+    }
+  } else if (args.grid) {
     console.log("GRID — todos os perfis comparados nas MESMAS condições:\n");
     const resultados = Object.keys(PERFIS).map(p => simular(p, series));
     resultados.sort((a, b) => b.expectancy - a.expectancy);
