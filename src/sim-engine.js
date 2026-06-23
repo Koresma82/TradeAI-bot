@@ -67,6 +67,8 @@ let dailyLossHit  = false;
 let lastSimLiveJson    = "";   // último simLive escrito (só reescreve se mudar)
 let lastSimLiveAt      = 0;    // timestamp da última escrita de simLive
 let lastHeartbeatAt    = 0;    // timestamp do último botStatus escrito
+let brokerReportCache  = [];   // relatório por broker (capacidades + saldo), cacheado
+let lastBrokerReportAt = 0;    // quando foi atualizado pela última vez
 let lastFeaturesJson   = "";   // últimas features escritas no botStatus
 const SIMLIVE_MIN_MS   = 60 * 1000;       // no máx. 1 escrita de simLive por minuto
 const PRICES_PUB_MS    = 2 * 60 * 1000;   // publica preços p/ a app a cada 2 min
@@ -133,7 +135,8 @@ let appSettings   = {
   // ── DCA (núcleo passivo) — defaults; sobrepostos pelas settings da app ──
   dcaAtivo: true, aiTradeAtivo: false, dcaPctCapital: 80,
   // Controlo granular do trading ativo (null = herda aiTradeAtivo p/ retrocompat).
-  aiEstrategias: false, aiManualAutonomo: false, aiDayTrading: false,
+  // aiBrainMestre = chave-mestra (opção C): nada de trading ativo sem ele ON.
+  aiBrainMestre: false, aiEstrategias: false, aiManualAutonomo: false, aiDayTrading: false,
   // ── DCA multi-plano ──
   dcaValorMensal: 100,        // o "bolo" por período repartido pelos planos
   dcaPlanos: [],              // [{ id, nome, carteira, alocacao, frequencia, ... }]
@@ -1121,6 +1124,12 @@ function initDCA() {
     priceOf:      (id) => (prices.isReal(id) ? (currentPrices[id]?.price ?? null) : null),
     buyDCA, sellDCA,
     now: () => Date.now(),
+    // Notifica o utilizador (Telegram) — usado para avisar de compras manuais.
+    notificar: (msg) => notify(msg).catch(() => {}),
+    // Grava uma ordem de compra manual pendente na coleção dcaManualOrders, para
+    // a app a mostrar e o utilizador confirmar.
+    criarOrdemManual: (ordem) => fb.saveSetting("server", `dcaManual_${ordem.id}`, ordem)
+      .catch((e) => logger.warn(`criarOrdemManual: ${e.message}`)),
     // Agenda a próxima compra de UM plano e regista a sua data de início.
     // Atualiza o plano dentro de appSettings.dcaPlanos e persiste em settings/dcaSchedule.
     agendarPlano: (planId, proximaTs, dataInicio) => {
@@ -1180,8 +1189,9 @@ async function tick() {
     // Atualizar sinais AI (intervalo configurável) e persistir para a app os mostrar.
     // SÓ quando alguma fonte que USA estes sinais está ligada (estratégias ou
     // compras autónomas). Se tudo isso está off, gerá-los seria queimar tokens à toa.
-    const precisaSinais = (appSettings.aiEstrategias ?? appSettings.aiTradeAtivo)
-                       || (appSettings.aiManualAutonomo ?? appSettings.aiTradeAtivo);
+    const mestreSig = !!appSettings.aiTradeAtivo || !!appSettings.aiBrainMestre;
+    const precisaSinais = mestreSig && ((appSettings.aiEstrategias ?? appSettings.aiTradeAtivo)
+                       || (appSettings.aiManualAutonomo ?? appSettings.aiTradeAtivo));
     if (precisaSinais) {
       const sigsBefore = JSON.stringify(aiSignals.getSignals());
       await aiSignals.refresh();
@@ -1193,7 +1203,10 @@ async function tick() {
 
     // Atualizar sentiment de notícias (só ajusta exposição, nunca SL/TP). Lê o
     // feed que a app escreve em settings/newsFeed (manchetes ou override manual).
-    if (appSettings.newsTilt) {
+    // Só corre se newsTilt ligado E o AI Brain mestre ligado — o sentiment só
+    // afeta o trading ativo, por isso sem mestre não vale a pena gastar tokens.
+    const mestreNews = !!appSettings.aiTradeAtivo || !!appSettings.aiBrainMestre;
+    if (appSettings.newsTilt && mestreNews) {
       const before = JSON.stringify(newsSentiment.getState());
       await newsSentiment.refresh(newsFeed || {});
       const after = newsSentiment.getState();
@@ -1229,14 +1242,18 @@ async function tick() {
     //   aiEstrategias    → bloco de estratégias (3)
     //   aiManualAutonomo → Cérebro AI autónomo (3c)
     //   aiDayTrading     → day-trade (3d)
-    // Compatibilidade: se aiTradeAtivo (o toggle antigo) estiver on, liga as três
-    // — assim configs antigas continuam a funcionar sem o utilizador reconfigurar.
+    // HIERARQUIA (opção C): aiBrainMestre é a chave-mestra. Nada de trading ativo
+    // corre sem ele ON. Com ele ON, cada fonte corre se a sua flag estiver ON.
+    // Compatibilidade: aiTradeAtivo (toggle antigo) liga mestre + as três fontes.
     const legacyOn = !!appSettings.aiTradeAtivo;
-    const onEstrat = appSettings.aiEstrategias ?? legacyOn;
-    const onManual = appSettings.aiManualAutonomo ?? legacyOn;
-    const onDay    = appSettings.aiDayTrading ?? legacyOn;
-    if (!onEstrat && !onManual && !onDay && tickCount % 30 === 0) {
-      logger.info("💤 Trading ativo todo desligado — só DCA passivo. Liga as fontes que quiseres na app.");
+    const mestre = legacyOn || !!appSettings.aiBrainMestre;
+    const onEstrat = mestre && (appSettings.aiEstrategias ?? legacyOn);
+    const onManual = mestre && (appSettings.aiManualAutonomo ?? legacyOn);
+    const onDay    = mestre && (appSettings.aiDayTrading ?? legacyOn);
+    if (!mestre && tickCount % 30 === 0) {
+      logger.info("💤 AI Brain (mestre) desligado — só DCA passivo. Liga-o nas Definições para usar trading ativo.");
+    } else if (mestre && !onEstrat && !onManual && !onDay && tickCount % 30 === 0) {
+      logger.info("AI Brain ON mas nenhuma fonte ativada — liga Estratégias / Compras / Day Trade nas Definições.");
     }
 
     // 3. Verificar sinais das estratégias
@@ -1414,6 +1431,12 @@ async function tick() {
       const fxEurUsd = prices.getFreshPrice("eurusd") || null; // USD por 1 EUR
       const brokerCurrency = broker.isLive() ? "USD" : "EUR";  // sim = EUR puro
       const rf = regimeFatores();
+      // Relatório por broker (capacidades + saldo real), atualizado a cada ~5 min
+      // para não martelar as APIs dos brokers a cada heartbeat.
+      if (now - lastBrokerReportAt > 5 * 60 * 1000 || !brokerReportCache.length) {
+        try { brokerReportCache = await broker.brokerReport(); lastBrokerReportAt = now; }
+        catch (e) { logger.warn(`brokerReport: ${e.message}`); }
+      }
       await fb.saveSetting("server", "botStatus", {
         alive:    true,
         mode:     broker.getMode(),
@@ -1435,6 +1458,10 @@ async function tick() {
         // Sentiment de notícias (só ajusta exposição, nunca SL/TP). A app mostra
         // o clima atual e a justificação para o utilizador perceber o ajuste.
         newsSentiment: appSettings.newsTilt ? newsSentiment.getState() : { bias: 0, label: "desligado", rationale: "", source: "off" },
+        // Relatório por broker: capacidades (que classes negoceia) + saldo real
+        // (em live). A app usa isto para o relatório financeiro e para saber de
+        // que conta sai cada plano DCA.
+        brokers: brokerReportCache,
       });
       lastHeartbeatAt  = now;
       lastFeaturesJson = featuresJson;
@@ -1479,6 +1506,18 @@ async function init() {
 
   // Inicializar o motor DCA (núcleo passivo) com o contexto do sim-engine.
   initDCA();
+
+  // Ligar o saldo manual do XTB (broker manual) ao valor das settings. A app
+  // introduz xtbSaldo e desconta a cada compra confirmada; o broker lê daqui.
+  try {
+    const xtb = broker.registry.byId("xtb");
+    if (xtb && xtb.setManualBalanceProvider) {
+      xtb.setManualBalanceProvider(() => {
+        const v = Number(appSettings.xtbSaldo);
+        return Number.isFinite(v) && v >= 0 ? v : null;
+      });
+    }
+  } catch (e) { logger.warn(`XTB manual balance: ${e.message}`); }
 
   // ── Verificar a corretora (em modo paper/real) ──
   try {
@@ -1673,6 +1712,7 @@ async function init() {
       // ── DCA (núcleo passivo) ──
       dcaAtivo:         val.dcaAtivo ?? true,
       aiTradeAtivo:     val.aiTradeAtivo ?? false,
+      aiBrainMestre:    val.aiBrainMestre ?? false,
       aiEstrategias:    val.aiEstrategias ?? null,
       aiManualAutonomo: val.aiManualAutonomo ?? null,
       aiDayTrading:     val.aiDayTrading ?? null,
@@ -1689,6 +1729,8 @@ async function init() {
       dcaAiTradePct:    val.dcaAiTradePct != null ? Number(val.dcaAiTradePct) : 20,
       dcaAiTradeValor:  Number(val.dcaAiTradeValor) || 0,
       dcaDataInicio:    val.dcaDataInicio ?? appSettings.dcaDataInicio ?? null,
+      // Saldo manual do XTB (broker manual). A app introduz e desconta às compras.
+      xtbSaldo:         val.xtbSaldo != null ? Number(val.xtbSaldo) : (appSettings.xtbSaldo ?? null),
     };
     aiSignals.setRefreshMinutes(appSettings.aiSignalsMin);
     logger.info(`Definições [${SETTINGS_DOC}]: máx ${appSettings.maxEstrategias} | rotação ${appSettings.rotacaoAtiva ? "ON" : "OFF"} | AI Brain ${appSettings.aiBrain ? `ON@${appSettings.aiBrainConfianca}%` : "OFF"} | Trailing ${appSettings.trailingStop ? `ON@${appSettings.trailingStopPct}%` : "OFF"} | teto €${appSettings.maxValorTrade} | Sinais ${appSettings.aiSignalsMin}min`);
@@ -1876,6 +1918,44 @@ async function processCommands(currentPrices) {
         await fb.saveBalance("server", simBalance).catch(() => {});
         await fb.markCommand(cmd.id, "FEITO", `apagados ${resumo.trades} trades, ${resumo.archives} arquivos`);
         logger.info("🧹 Base de dados limpa por comando da app — recomeço de raiz.");
+      } else if (cmd.type === "DCA_MANUAL_CONFIRM" && Array.isArray(cmd.itens)) {
+        // O utilizador comprou à mão no broker e confirma. Regista as posições DCA
+        // (HOLD) com os preços que ele indicou (ou os sugeridos). Não mexe no saldo
+        // simulado porque o dinheiro é real e está fora do bot — estas posições são
+        // registadas com flag manualReal para o relatório as tratar à parte.
+        for (const it of cmd.itens) {
+          const price = Number(it.preco) || (currentPrices[it.assetId]?.price) || 0;
+          const eur = Number(it.eur);
+          // Validação: preço e valor positivos e dentro de limites sãos.
+          if (!price || price <= 0 || !eur || eur <= 0 || eur > 1000000) continue;
+          const units = eur / price;
+          const planId = cmd.planId || "principal";
+          const existente = Object.values(openPositions).find(p => p.stratId === "dca" && p.assetId === it.assetId && (p.planId || "principal") === planId);
+          if (existente) {
+            const totU = existente.units + units, totA = (existente.amount || 0) + Number(it.eur);
+            existente.units = +totU.toFixed(8); existente.amount = +totA.toFixed(2);
+            existente.entryPrice = +(totA / totU).toFixed(6);
+            await fb.saveTrade("server", existente);
+          } else {
+            const posId = `manual_dca_${planId}_${Date.now()}_${it.assetId}`;
+            const position = {
+              id: posId, assetId: it.assetId, assetName: it.assetId, assetSym: it.assetId.toUpperCase(),
+              entryPrice: price, units: +units.toFixed(8), amount: +Number(it.eur).toFixed(2),
+              peak: price, sl: null, tp: null,
+              strategy: `DCA · ${cmd.planNome || "Manual"}`, stratId: "dca", planId, planNome: cmd.planNome || "Manual",
+              manualReal: true, broker: cmd.broker || null,
+              openedAt: new Date().toLocaleString("pt-PT"), openedTs: Date.now(),
+              status: "ABERTA", mode: broker.getMode(),
+            };
+            openPositions[posId] = position;
+            await fb.saveTrade("server", position);
+          }
+        }
+        // Apaga a ordem pendente e reagenda já foi feito pelo motor. O desconto do
+        // saldo manual do XTB é feito pela app (que é dona das settings do modo).
+        if (cmd.ordemId) await fb.saveSetting("server", `dcaManual_${cmd.ordemId}`, { estado: "FEITA", concluidoEm: Date.now() }).catch(() => {});
+        await fb.markCommand(cmd.id, "FEITO", `DCA manual registado (${cmd.itens.length} ativos)`);
+        logger.info(`✅ DCA manual confirmado pelo utilizador (${cmd.planNome}) — posições registadas`);
       } else {
         await fb.markCommand(cmd.id, "FALHOU", "comando inválido");
       }

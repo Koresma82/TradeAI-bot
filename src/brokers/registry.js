@@ -13,6 +13,7 @@
 const adapters = [
   require("./alpaca.adapter"),
   require("./binance.adapter"),
+  require("./xtb.adapter"),
   // require("./ibkr.adapter"),   // ← exemplo: descomenta quando criares o adaptador IBKR
 ];
 

@@ -92,9 +92,58 @@ async function tickCompras() {
 
     const valorPlano = +(reparticao[plano.id] || 0).toFixed(2);
     if (valorPlano >= 1) {
-      await executarCompraPlano(plano, carteira, valorPlano);
+      // Planos MANUAIS (ETF/ações em brokers sem API automática): o bot não
+      // executa — calcula o que comprar e cria uma "ordem pendente" + notifica.
+      // O utilizador compra à mão no seu broker e confirma na app/Telegram.
+      if (plano.modoExecucao === "manual") {
+        await criarOrdemManual(plano, carteira, valorPlano);
+      } else {
+        await executarCompraPlano(plano, carteira, valorPlano);
+      }
     }
     await ctx.agendarPlano(plano.id, agora + intervalo, plano.dataInicio || agora);
+  }
+}
+
+// Cria uma ordem de compra manual pendente: lista o que comprar (€ e ativo, com
+// preço sugerido atual) e avisa por Telegram. Fica à espera de confirmação.
+async function criarOrdemManual(plano, carteira, valorPlano) {
+  const somaPesos = carteira.reduce((a, c) => a + c.peso, 0) || 100;
+  const itens = carteira.map(item => {
+    const eur = +(valorPlano * (item.peso / somaPesos)).toFixed(2);
+    const px = ctx.priceOf(item.id);
+    return { assetId: item.id, eur, precoSugerido: px };
+  }).filter(i => i.eur >= 1);
+  if (!itens.length) return;
+
+  const ordem = {
+    id: `dca_manual_${plano.id}_${Date.now()}`,
+    planId: plano.id, planNome: plano.nome,
+    valorTotal: valorPlano, itens,
+    broker: plano.brokerId || null,
+    criadoEm: Date.now(), estado: "PENDENTE",
+  };
+  await ctx.criarOrdemManual(ordem);
+
+  // Notificação clara do que fazer, com link direto para confirmar na app.
+  const linhas = itens.map(i => `  • €${i.eur} de ${i.assetId.toUpperCase()}${i.precoSugerido ? ` (~$${i.precoSugerido})` : ""}`);
+  const appUrl = (process.env.APP_URL || "https://tradeaiko.netlify.app").replace(/\/$/, "");
+  const msg = [
+    `🔔 DCA "${plano.nome}" — está na hora da compra!`,
+    `Compra no teu broker (total €${valorPlano.toFixed(2)}):`,
+    ...linhas,
+    ``,
+    `👉 Confirmar aqui: ${appUrl}/?tab=dca`,
+  ].join("\n");
+  await ctx.notificar(msg);
+  logger.info(`🔔 DCA[${plano.nome}]: ordem manual criada (€${valorPlano}) — utilizador notificado`);
+
+  // Lembrete de depósito: se o saldo manual do broker (XTB) está a ficar baixo
+  // (menos de 2x o valor desta compra), avisa para depositar, evitando falhas.
+  const s2 = ctx.settings();
+  const saldoXtb = Number(s2.xtbSaldo);
+  if (Number.isFinite(saldoXtb) && saldoXtb < valorPlano * 2) {
+    await ctx.notificar(`⚠️ Saldo XTB baixo (€${saldoXtb.toFixed(2)}). Considera depositar para não falhares as próximas compras DCA.`);
   }
 }
 

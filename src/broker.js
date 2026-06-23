@@ -204,6 +204,35 @@ async function getPositions() {
   return any ? out : null;
 }
 
+// Relatório por broker: para CADA broker registado (ligado ou não), devolve as
+// suas capacidades e — se ligado e em modo live — o saldo. Alimenta o relatório
+// financeiro da app. Em modo sim, devolve só as capacidades (sem saldo real).
+async function brokerReport() {
+  const out = [];
+  for (const a of registry.all()) {
+    let conectado = false;
+    try { conectado = a.isConnected(); } catch { conectado = false; }
+    const entry = {
+      id: a.id,
+      nome: a.name || a.id,
+      assetClasses: Array.isArray(a.assetClasses) ? a.assetClasses : [],
+      conectado,
+      permitidoNoModo: adapterAllowedInMode(a),
+      saldo: null,
+      moeda: a.id === "binance" ? "USDT" : a.id === "xtb" ? "EUR" : "USD",
+      erro: null,
+    };
+    // Saldo: em live com broker ligado, ou sempre para brokers MANUAIS (o saldo
+    // deles é introduzido pelo utilizador, não depende do modo do bot).
+    if ((LIVE && conectado && entry.permitidoNoModo) || a.manual) {
+      try { entry.saldo = await a.getBalance(); }
+      catch (e) { entry.erro = e.message; }
+    }
+    out.push(entry);
+  }
+  return out;
+}
+
 // ── COMPRA ───────────────────────────────────────────────────────────────────
 async function buy({ assetId, amount, price, sl, tp }) {
   if (!LIVE) {
@@ -255,6 +284,6 @@ function isCrypto(assetId) { return CRYPTO_IDS.has(assetId); }
 module.exports = {
   getMode, isLive, isReal, verifyConnection, getBalance, getPositions,
   buy, sell, cancelBracket, isCrypto, assetClass, pickAdapter, explainRouting,
-  estimateFee, roundTripFee, feeRate,
+  estimateFee, roundTripFee, feeRate, brokerReport,
   registry,
 };
