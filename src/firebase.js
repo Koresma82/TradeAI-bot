@@ -236,6 +236,21 @@ async function getSetting(uid, key) {
   } catch { return null; }
 }
 
+// ── Lista consolidada de ordens DCA manuais pendentes ────────────────────────
+// Mantém um único doc settings/dcaManualPendentes com a lista, para a app
+// subscrever só esse doc (barato, sem ler a coleção inteira).
+async function appendManualOrder(ordem) {
+  const atual = (await getSetting("server", "dcaManualPendentes")) || [];
+  const lista = Array.isArray(atual) ? atual.filter(o => o.id !== ordem.id) : [];
+  lista.push(ordem);
+  await saveSetting("server", "dcaManualPendentes", lista);
+}
+async function removeManualOrder(ordemId) {
+  const atual = (await getSetting("server", "dcaManualPendentes")) || [];
+  const lista = Array.isArray(atual) ? atual.filter(o => o.id !== ordemId) : [];
+  await saveSetting("server", "dcaManualPendentes", lista);
+}
+
 // ── Subscrever definições em tempo real ──────────────────────────────────────
 function watchSetting(key, callback) {
   return userDoc("settings", key).onSnapshot(snap => {
@@ -490,6 +505,8 @@ module.exports = {
   saveBalance,
   logError,
   getSetting,
+  appendManualOrder,
+  removeManualOrder,
   watchSetting,
   archiveClosedTrades,
   getLastArchivedDay,

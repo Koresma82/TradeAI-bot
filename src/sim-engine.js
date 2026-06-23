@@ -1128,8 +1128,14 @@ function initDCA() {
     notificar: (msg) => notify(msg).catch(() => {}),
     // Grava uma ordem de compra manual pendente na coleção dcaManualOrders, para
     // a app a mostrar e o utilizador confirmar.
-    criarOrdemManual: (ordem) => fb.saveSetting("server", `dcaManual_${ordem.id}`, ordem)
-      .catch((e) => logger.warn(`criarOrdemManual: ${e.message}`)),
+    // Grava a ordem manual e mantém também uma LISTA consolidada num único doc
+    // (dcaManualPendentes), para a app subscrever só esse doc — barato e sem loops.
+    criarOrdemManual: async (ordem) => {
+      try {
+        await fb.saveSetting("server", `dcaManual_${ordem.id}`, ordem);
+        await fb.appendManualOrder(ordem);
+      } catch (e) { logger.warn(`criarOrdemManual: ${e.message}`); }
+    },
     // Agenda a próxima compra de UM plano e regista a sua data de início.
     // Atualiza o plano dentro de appSettings.dcaPlanos e persiste em settings/dcaSchedule.
     agendarPlano: (planId, proximaTs, dataInicio) => {
@@ -1953,7 +1959,7 @@ async function processCommands(currentPrices) {
         }
         // Apaga a ordem pendente e reagenda já foi feito pelo motor. O desconto do
         // saldo manual do XTB é feito pela app (que é dona das settings do modo).
-        if (cmd.ordemId) await fb.saveSetting("server", `dcaManual_${cmd.ordemId}`, { estado: "FEITA", concluidoEm: Date.now() }).catch(() => {});
+        if (cmd.ordemId) { await fb.saveSetting("server", `dcaManual_${cmd.ordemId}`, { estado: "FEITA", concluidoEm: Date.now() }).catch(() => {}); await fb.removeManualOrder(cmd.ordemId).catch(() => {}); }
         await fb.markCommand(cmd.id, "FEITO", `DCA manual registado (${cmd.itens.length} ativos)`);
         logger.info(`✅ DCA manual confirmado pelo utilizador (${cmd.planNome}) — posições registadas`);
       } else {
