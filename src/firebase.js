@@ -155,6 +155,7 @@ async function resetAllData(capitalInicial = 1000) {
   resumo.archives = await apagarColecao("archives");
   resumo.stats    = await apagarColecao("stats");
   resumo.logs     = await apagarColecao("logs");
+  resumo.strategies = await apagarColecao("strategies");
   // Repor saldo ao capital inicial.
   await saveBalance(USER_UID, capitalInicial);
   logger.info(`🧹 Reset total: ${resumo.trades} trades, ${resumo.archives} arquivos, ${resumo.stats} stats, ${resumo.logs} logs apagados. Saldo reposto a €${capitalInicial}.`);
