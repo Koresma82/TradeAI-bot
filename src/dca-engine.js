@@ -74,6 +74,15 @@ function repartir(planos, bolo) {
 async function tickCompras() {
   const s = ctx.settings();
   if (!s.dcaAtivo) return;
+  // Modo férias: se há uma pausa agendada e ainda não terminou, não compra.
+  // Quando a data passa, retoma sozinho (e avisa).
+  if (s.dcaPausadoAte) {
+    const ate = Number(s.dcaPausadoAte);
+    if (ctx.now() < ate) return;
+    // A pausa terminou → limpa e avisa.
+    await ctx.guardarSetting("dcaPausadoAte", null);
+    await ctx.notificar("🏖️ Modo férias terminou — os teus planos DCA voltaram a comprar normalmente.");
+  }
   const planos = getPlanos();
   if (!planos.length) return;
   const bolo = Number(s.dcaValorMensal) || 0;
@@ -225,10 +234,143 @@ async function tickReequilibrio() {
   }
 }
 
+// Alerta de "compra em queda": se um ativo de um plano caiu bastante face ao
+// preço médio das posições atuais, avisa (oportunidade de reforçar). Throttle
+// por ativo para não repetir.
+let lastDipAlert = {};
+async function tickAlertaQueda() {
+  const s = ctx.settings();
+  if (!s.dcaAtivo || !s.dcaAlertaQueda) return; // opt-in
+  const planos = getPlanos();
+  const agora = ctx.now();
+  for (const plano of planos) {
+    for (const item of (plano.carteira || [])) {
+      const px = ctx.priceOf(item.id);
+      if (!px) continue;
+      const posicoes = ctx.dcaPositions().filter(p => p.planId === plano.id && p.assetId === item.id);
+      if (!posicoes.length) continue;
+      const totU = posicoes.reduce((a, p) => a + p.units, 0);
+      const totA = posicoes.reduce((a, p) => a + (p.amount || 0), 0);
+      const precoMedio = totU > 0 ? totA / totU : 0;
+      if (!precoMedio) continue;
+      const queda = (px - precoMedio) / precoMedio; // negativo = abaixo do médio
+      const chave = `${plano.id}_${item.id}`;
+      // Alerta se caiu >12% face ao preço médio, e não alertou nas últimas 24h.
+      if (queda <= -0.12 && (agora - (lastDipAlert[chave] || 0)) > 24 * 3600 * 1000) {
+        lastDipAlert[chave] = agora;
+        await ctx.notificar(`📉 ${item.id.toUpperCase()} está ${(queda * 100).toFixed(1)}% abaixo do teu preço médio no plano "${plano.nome}". Pode ser uma boa altura para reforçar — quedas são oportunidades no DCA de longo prazo. (Não é aconselhamento; decide tu.)`);
+      }
+    }
+  }
+}
+
+// Resumo mensal: no primeiro tick de cada mês, envia por Telegram um balanço do
+// mês anterior (investido, valor atual, P&L por plano).
+async function tickResumoMensal() {
+  const s = ctx.settings();
+  if (!s.dcaResumoMensal) return; // opt-in
+  const agora = new Date(ctx.now());
+  const mesAtual = `${agora.getFullYear()}-${agora.getMonth()}`;
+  if (s._ultimoResumoMes === mesAtual) return; // já enviou este mês
+  // Só envia nos primeiros 2 dias do mês (evita enviar a meio se o bot reinicia).
+  if (agora.getDate() > 2) { await ctx.guardarSetting("_ultimoResumoMes", mesAtual); return; }
+
+  const planos = getPlanos();
+  const linhas = [];
+  let totalInv = 0, totalVal = 0;
+  for (const plano of planos) {
+    const posicoes = ctx.dcaPositions().filter(p => p.planId === plano.id);
+    if (!posicoes.length) continue;
+    const inv = posicoes.reduce((a, p) => a + (p.amount || 0), 0);
+    const val = posicoes.reduce((a, p) => { const px = ctx.priceOf(p.assetId); return a + (px ? p.units * px : (p.amount || 0)); }, 0);
+    const pl = val - inv;
+    totalInv += inv; totalVal += val;
+    linhas.push(`  • ${plano.nome}: investido €${inv.toFixed(0)}, vale €${val.toFixed(0)} (${pl >= 0 ? "+" : ""}€${pl.toFixed(0)})`);
+  }
+  if (linhas.length) {
+    const plTotal = totalVal - totalInv;
+    const msg = [
+      `📅 Resumo mensal dos teus planos DCA:`,
+      ...linhas,
+      ``,
+      `Total: investido €${totalInv.toFixed(0)}, vale €${totalVal.toFixed(0)} (${plTotal >= 0 ? "+" : ""}€${plTotal.toFixed(0)}).`,
+      `Continua firme — o DCA premeia a consistência. 💪`,
+    ].join("\n");
+    await ctx.notificar(msg);
+  }
+  await ctx.guardarSetting("_ultimoResumoMes", mesAtual);
+}
+
+// ── Lembretes de aporte manual + contabilidade de atraso ─────────────────────
+// Para planos manuais, em vez de criar uma ordem por período, o bot manda um
+// lembrete DIÁRIO até o utilizador confirmar que investiu nesse período. Mantém
+// a conta de quanto devia ter investido vs quanto investiu (atraso).
+let lastLembreteDia = {};
+async function tickLembretes() {
+  const s = ctx.settings();
+  if (!s.dcaAtivo || s.dcaPausadoAte && Number(s.dcaPausadoAte) > ctx.now()) return;
+  if (!s.dcaLembretes) return; // opt-in
+  const planos = getPlanos().filter(p => p.modoExecucao === "manual");
+  if (!planos.length) return;
+
+  const agora = ctx.now();
+  const hoje = new Date(agora).toDateString();
+  const reparticao = repartir(getPlanos(), Number(s.dcaValorMensal) || 0);
+
+  for (const plano of planos) {
+    const carteira = (plano.carteira || []).filter(c => c.peso > 0);
+    if (!carteira.length) continue;
+    const valorPlano = +(reparticao[plano.id] || 0).toFixed(2);
+    if (valorPlano < 1) continue;
+
+    // Contabilidade: períodos decorridos desde o início vs aportes confirmados.
+    const conta = contabilidadeAtraso(plano, valorPlano, s);
+    if (conta.emFalta <= 0) continue; // está em dia, nada a lembrar
+
+    // Lembrete diário (1x por dia por plano).
+    const chave = `${plano.id}_${hoje}`;
+    if (lastLembreteDia[chave]) continue;
+    lastLembreteDia[chave] = true;
+
+    const appUrl = (process.env.APP_URL || "https://tradeaiko.netlify.app").replace(/\/$/, "");
+    const periodos = conta.periodosEmFalta;
+    const msg = [
+      `🔔 Lembrete de investimento — plano "${plano.nome}"`,
+      periodos > 1
+        ? `Tens ${periodos} aportes por fazer (€${conta.emFalta.toFixed(0)} no total).`
+        : `Está na hora do teu aporte de €${valorPlano.toFixed(0)}.`,
+      ``,
+      `Compra no teu broker e confirma na app 👉 ${appUrl}/?tab=dca`,
+    ].join("\n");
+    await ctx.notificar(msg);
+    logger.info(`🔔 Lembrete DCA[${plano.nome}]: €${conta.emFalta.toFixed(0)} em falta (${periodos} períodos)`);
+  }
+}
+
+// Calcula a contabilidade de um plano manual: quanto devia ter investido até
+// agora, quanto investiu (confirmado), e o que está em falta.
+function contabilidadeAtraso(plano, valorPlano, s) {
+  const agora = ctx.now();
+  const inicio = plano.dataInicio || agora;
+  const intervalo = FREQ_MS[plano.frequencia] || FREQ_MS.mensal;
+  // Períodos decorridos (inclui o atual): quantos aportes já deviam ter acontecido.
+  const periodosDecorridos = Math.max(1, Math.floor((agora - inicio) / intervalo) + 1);
+  const devido = periodosDecorridos * valorPlano;
+  // Confirmado: lê o registo de aportes confirmados deste plano.
+  const registo = (s.dcaAportes && s.dcaAportes[plano.id]) || { total: 0, periodos: 0 };
+  const investido = registo.total || 0;
+  const emFalta = +(devido - investido).toFixed(2);
+  const periodosEmFalta = valorPlano > 0 ? Math.max(0, Math.round(emFalta / valorPlano)) : 0;
+  return { devido, investido, emFalta, periodosDecorridos, periodosEmFalta };
+}
+
 async function tick() {
   if (!ctx) return;
   try { await tickCompras(); }       catch (e) { logger.warn(`DCA compras: ${e.message}`); }
   try { await tickReequilibrio(); }  catch (e) { logger.warn(`DCA reequilíbrio: ${e.message}`); }
+  try { await tickAlertaQueda(); }   catch (e) { logger.warn(`DCA alerta queda: ${e.message}`); }
+  try { await tickResumoMensal(); }  catch (e) { logger.warn(`DCA resumo mensal: ${e.message}`); }
+  try { await tickLembretes(); }     catch (e) { logger.warn(`DCA lembretes: ${e.message}`); }
 }
 
-module.exports = { init, tick, getPlanos, repartir };
+module.exports = { init, tick, getPlanos, repartir, contabilidadeAtraso };

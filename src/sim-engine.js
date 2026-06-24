@@ -1126,6 +1126,14 @@ function initDCA() {
     now: () => Date.now(),
     // Notifica o utilizador (Telegram) — usado para avisar de compras manuais.
     notificar: (msg) => notify(msg).catch(() => {}),
+    // Persiste um campo de estado interno (ex.: _ultimoResumoMes) no doc de
+    // settings do modo, e atualiza appSettings em memória.
+    guardarSetting: async (chave, valor) => {
+      try {
+        appSettings[chave] = valor;
+        await fb.saveSetting("server", chave, valor);
+      } catch (e) { logger.warn(`guardarSetting ${chave}: ${e.message}`); }
+    },
     // Grava uma ordem de compra manual pendente na coleção dcaManualOrders, para
     // a app a mostrar e o utilizador confirmar.
     // Grava a ordem manual e mantém também uma LISTA consolidada num único doc
@@ -1513,6 +1521,12 @@ async function init() {
   // Inicializar o motor DCA (núcleo passivo) com o contexto do sim-engine.
   initDCA();
 
+  // Carrega a contabilidade de aportes DCA (gravada na key server/dcaAportes).
+  try {
+    const ap = await fb.getSetting("server", "dcaAportes");
+    if (ap && typeof ap === "object") appSettings.dcaAportes = ap;
+  } catch {}
+
   // Ligar o saldo manual do XTB (broker manual) ao valor das settings. A app
   // introduz xtbSaldo e desconta a cada compra confirmada; o broker lê daqui.
   try {
@@ -1737,6 +1751,14 @@ async function init() {
       dcaDataInicio:    val.dcaDataInicio ?? appSettings.dcaDataInicio ?? null,
       // Saldo manual do XTB (broker manual). A app introduz e desconta às compras.
       xtbSaldo:         val.xtbSaldo != null ? Number(val.xtbSaldo) : (appSettings.xtbSaldo ?? null),
+      // Notificações DCA opcionais (opt-in pela app)
+      dcaAlertaQueda:   val.dcaAlertaQueda ?? appSettings.dcaAlertaQueda ?? false,
+      dcaResumoMensal:  val.dcaResumoMensal ?? appSettings.dcaResumoMensal ?? false,
+      dcaPausadoAte:    val.dcaPausadoAte ?? appSettings.dcaPausadoAte ?? null,
+      // Lembretes de aporte manual + registo de aportes confirmados (contabilidade)
+      dcaLembretes:     val.dcaLembretes ?? appSettings.dcaLembretes ?? false,
+      dcaAportes:       val.dcaAportes ?? appSettings.dcaAportes ?? {},
+      _ultimoResumoMes: appSettings._ultimoResumoMes ?? null,
     };
     aiSignals.setRefreshMinutes(appSettings.aiSignalsMin);
     logger.info(`Definições [${SETTINGS_DOC}]: máx ${appSettings.maxEstrategias} | rotação ${appSettings.rotacaoAtiva ? "ON" : "OFF"} | AI Brain ${appSettings.aiBrain ? `ON@${appSettings.aiBrainConfianca}%` : "OFF"} | Trailing ${appSettings.trailingStop ? `ON@${appSettings.trailingStopPct}%` : "OFF"} | teto €${appSettings.maxValorTrade} | Sinais ${appSettings.aiSignalsMin}min`);
@@ -1960,6 +1982,21 @@ async function processCommands(currentPrices) {
         // Apaga a ordem pendente e reagenda já foi feito pelo motor. O desconto do
         // saldo manual do XTB é feito pela app (que é dona das settings do modo).
         if (cmd.ordemId) { await fb.saveSetting("server", `dcaManual_${cmd.ordemId}`, { estado: "FEITA", concluidoEm: Date.now() }).catch(() => {}); await fb.removeManualOrder(cmd.ordemId).catch(() => {}); }
+        // Contabilidade de aportes: regista quanto foi investido neste plano, para
+        // o sistema de lembretes saber o que está em dia / em falta.
+        if (cmd.planId) {
+          const totalAporte = cmd.itens.reduce((a, it) => a + (Number(it.eur) || 0), 0);
+          const aportes = { ...(appSettings.dcaAportes || {}) };
+          const reg = aportes[cmd.planId] || { total: 0, periodos: 0 };
+          reg.total = +((reg.total || 0) + totalAporte).toFixed(2);
+          reg.periodos = (reg.periodos || 0) + 1;
+          reg.ultimo = Date.now();
+          aportes[cmd.planId] = reg;
+          appSettings.dcaAportes = aportes;
+          await fb.saveSetting("server", "dcaAportes", aportes).catch(() => {});
+          // Limpa o lembrete de hoje para este plano (já investiu).
+          await fb.saveSetting("server", "dcaAporteConfirmado", { planId: cmd.planId, ts: Date.now() }).catch(() => {});
+        }
         await fb.markCommand(cmd.id, "FEITO", `DCA manual registado (${cmd.itens.length} ativos)`);
         logger.info(`✅ DCA manual confirmado pelo utilizador (${cmd.planNome}) — posições registadas`);
       } else {
