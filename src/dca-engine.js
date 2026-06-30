@@ -373,4 +373,17 @@ async function tick() {
   try { await tickLembretes(); }     catch (e) { logger.warn(`DCA lembretes: ${e.message}`); }
 }
 
-module.exports = { init, tick, getPlanos, repartir, contabilidadeAtraso };
+module.exports = { init, tick, getPlanos, repartir, contabilidadeAtraso, iniciarPlanoAgora };
+
+// Força a compra imediata de um plano (usado pelo botão "Iniciar plano" da app).
+// Executa no broker (Binance/Alpaca) tal como uma compra DCA automática normal.
+async function iniciarPlanoAgora(planId, valorPlano) {
+  if (!ctx) return { ok: false, reason: "motor não iniciado" };
+  const plano = getPlanos().find(p => p.id === planId);
+  if (!plano) return { ok: false, reason: "plano não encontrado" };
+  const carteira = (plano.carteira || []).filter(c => c.peso > 0);
+  if (!carteira.length) return { ok: false, reason: "carteira vazia" };
+  logger.info(`🚀 Iniciar plano "${plano.nome}" — primeira compra de €${valorPlano} (manual via botão)`);
+  await executarCompraPlano(plano, carteira, valorPlano);
+  return { ok: true };
+}

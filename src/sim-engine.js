@@ -1933,6 +1933,14 @@ async function processCommands(currentPrices) {
         const amount = Math.max(10, Number(cmd.amount) || 0);
         const r = await buyManual({ assetId: cmd.assetId, amount });
         await fb.markCommand(cmd.id, r.ok ? "FEITO" : "FALHOU", r.ok ? "comprado" : r.reason);
+      } else if (cmd.type === "DCA_INICIAR" && cmd.planId) {
+        // Botão "Iniciar plano": força a primeira compra AGORA, executando no
+        // broker (Binance/Alpaca) — fluxo automático real, não só registo.
+        if (botPaused) { await fb.markCommand(cmd.id, "FALHOU", "bot pausado"); continue; }
+        const valorPlano = Number(cmd.valorPlano) || 0;
+        if (valorPlano < 1) { await fb.markCommand(cmd.id, "FALHOU", "valor do plano inválido"); continue; }
+        const r = await dcaEngine.iniciarPlanoAgora(cmd.planId, valorPlano);
+        await fb.markCommand(cmd.id, r.ok ? "FEITO" : "FALHOU", r.ok ? "plano iniciado" : r.reason);
       } else if (cmd.type === "RESET_ALL") {
         // Recomeço de raiz: apaga trades/arquivos/stats/logs e repõe o saldo.
         // Limpa também o estado em memória para o bot recomeçar limpo sem reiniciar.
