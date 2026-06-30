@@ -80,12 +80,20 @@ module.exports = {
 
   async verifyConnection() {
     if (!this.isConnected()) throw new Error("Binance não configurada — define BINANCE_API_KEY e BINANCE_SECRET_KEY");
-    const acc = await signedFetch("/api/v3/account");
-    const usdt = acc.balances?.find(b => b.asset === "USDT");
-    const free = usdt ? parseFloat(usdt.free).toFixed(2) : "0.00";
     const testnet = BASE_URL.includes("testnet");
-    logger.info(`  └ Binance ${testnet ? "TESTNET 🧪" : "LIVE 💵"} | USDT livre: $${free}`);
-    return { ok: true, name: this.name, detail: { testnet, usdt: free } };
+    // Regista o MODO já, antes do saldo — assim aparece nos logs mesmo que a
+    // chamada de saldo falhe (ex.: chaves erradas, conta testnet sem fundos).
+    logger.info(`  └ Binance ${testnet ? "TESTNET 🧪" : "LIVE 💵"} | base=${BASE_URL}`);
+    try {
+      const acc = await signedFetch("/api/v3/account");
+      const usdt = acc.balances?.find(b => b.asset === "USDT");
+      const free = usdt ? parseFloat(usdt.free).toFixed(2) : "0.00";
+      logger.info(`  └ Binance ${testnet ? "TESTNET 🧪" : "LIVE 💵"} ligado | USDT livre: $${free}`);
+      return { ok: true, name: this.name, detail: { testnet, usdt: free } };
+    } catch (e) {
+      logger.warn(`  └ Binance ${testnet ? "TESTNET" : "LIVE"}: saldo falhou (${e.message}). Verifica as chaves ${testnet ? "do TESTNET (testnet.binance.vision)" : "de produção"} e se a conta tem USDT.`);
+      throw e;
+    }
   },
 
   isLive() { return !BASE_URL.includes("testnet"); },
