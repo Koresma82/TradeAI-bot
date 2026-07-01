@@ -251,6 +251,20 @@ async function removeManualOrder(ordemId) {
   await saveSetting("server", "dcaManualPendentes", lista);
 }
 
+// Guarda um ponto diário do valor da carteira, para o gráfico de evolução na app.
+// Mantém no máximo ~180 pontos (6 meses) para não crescer sem limite.
+async function savePortfolioPoint(valorTotal, investido) {
+  const hist = (await getSetting("server", "portfolioHistory")) || [];
+  const arr = Array.isArray(hist) ? hist : [];
+  const hoje = new Date().toISOString().split("T")[0]; // YYYY-MM-DD
+  const ponto = { d: hoje, v: +valorTotal.toFixed(2), inv: +investido.toFixed(2), ts: Date.now() };
+  // Um ponto por dia: substitui o de hoje se já existir.
+  const semHoje = arr.filter(p => p.d !== hoje);
+  semHoje.push(ponto);
+  const recortado = semHoje.slice(-180);
+  await saveSetting("server", "portfolioHistory", recortado);
+}
+
 // ── Subscrever definições em tempo real ──────────────────────────────────────
 function watchSetting(key, callback) {
   return userDoc("settings", key).onSnapshot(snap => {
@@ -507,6 +521,7 @@ module.exports = {
   getSetting,
   appendManualOrder,
   removeManualOrder,
+  savePortfolioPoint,
   watchSetting,
   archiveClosedTrades,
   getLastArchivedDay,

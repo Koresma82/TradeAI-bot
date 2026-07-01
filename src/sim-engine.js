@@ -67,6 +67,7 @@ let dailyLossHit  = false;
 let lastSimLiveJson    = "";   // último simLive escrito (só reescreve se mudar)
 let lastSimLiveAt      = 0;    // timestamp da última escrita de simLive
 let lastHeartbeatAt    = 0;    // timestamp do último botStatus escrito
+let lastSnapshotDay    = "";   // último dia em que gravou o ponto de carteira
 let brokerReportCache  = [];   // relatório por broker (capacidades + saldo), cacheado
 let lastBrokerReportAt = 0;    // quando foi atualizado pela última vez
 let lastFeaturesJson   = "";   // últimas features escritas no botStatus
@@ -1205,6 +1206,20 @@ async function tick() {
     // 1. Refresh preços
     await prices.refreshAll();
     const currentPrices = prices.getAll();
+
+    // Snapshot diário do valor da carteira (para o gráfico de evolução na app).
+    const hojeSnap = new Date().toISOString().split("T")[0];
+    if (hojeSnap !== lastSnapshotDay) {
+      lastSnapshotDay = hojeSnap;
+      try {
+        const valorPos = Object.values(openPositions).reduce((a, p) => {
+          const px = currentPrices[p.assetId]?.price;
+          return a + (px ? p.units * px : (p.amount || 0));
+        }, 0);
+        const valorTotal = simBalance + valorPos;
+        await fb.savePortfolioPoint(valorTotal, totalInvested);
+      } catch (e) { logger.warn(`snapshot carteira: ${e.message}`); }
+    }
 
     // Reavalia o REGIME de mercado a cada REGIME_MS (10 min). É uma leitura de
     // fundo (MM50 de BTC/SPY), não muda a cada tick. Mesmo com o modo dinâmico
