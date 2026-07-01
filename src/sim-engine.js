@@ -335,7 +335,33 @@ async function checkSLTP(currentPrices) {
     // Posições DCA são HOLD passivo — sem SL/TP, NUNCA fechadas por esta lógica.
     // O motor DCA (dca-engine.js) é que as gere (compra/reequilíbrio). Saltar aqui
     // é o que mantém o núcleo passivo intocado pelo trading ativo.
-    if (pos.stratId === "dca") continue;
+    if (pos.stratId === "dca") {
+      // EXCEÇÃO: posições que o utilizador passou para o AI Brain gerir com um
+      // lucro-alvo. Só vendem quando estão em LUCRO acima do alvo (já líquido de
+      // taxas). Nunca vendem a perder — mantêm-se como o DCA faria.
+      if (pos.aiGerido && pos.lucroAlvo > 0) {
+        const px = prices.isReal(pos.assetId) ? currentPrices[pos.assetId]?.price : null;
+        if (px) {
+          const valorAtual = px * pos.units;
+          const investido = pos.amount || (pos.entryPrice * pos.units);
+          // Taxa real de saída (round-trip já contabiliza a corretora do ativo).
+          const feeVenda = broker.roundTripFee(pos.assetId, investido);
+          const lucroLiquido = valorAtual - investido - feeVenda;
+          const pctLiquido = investido > 0 ? (lucroLiquido / investido) * 100 : 0;
+          if (pctLiquido >= pos.lucroAlvo) {
+            try {
+              const r = await closePositionManual(posId, currentPrices);
+              if (r?.ok) {
+                logger.info(`  💰 AI vendeu ${pos.assetSym || pos.assetId} em lucro-alvo ${pos.lucroAlvo}%: +€${lucroLiquido.toFixed(2)} (${pctLiquido.toFixed(1)}% líquido)`);
+                logEvent("sell", `💰 AI vendeu ${pos.assetSym || pos.assetId} em lucro: +€${lucroLiquido.toFixed(2)} (${pctLiquido.toFixed(1)}%, alvo ${pos.lucroAlvo}%)`);
+                await notify(`💰 AI Brain vendeu ${pos.assetSym || pos.assetId} em lucro: +€${lucroLiquido.toFixed(2)} (${pctLiquido.toFixed(1)}%). Atingiu o teu alvo de ${pos.lucroAlvo}%.`).catch(() => {});
+              }
+            } catch (e) { logger.warn(`AI-gerido venda ${pos.assetId}: ${e.message}`); }
+          }
+        }
+      }
+      continue;
+    }
 
     // Só geримос com preço REAL e fresco. Um preço "seed" (base estático) ou
     // stale não pode disparar SL/TP/AI-EXIT — senão comparávamos a entrada real
@@ -1084,6 +1110,7 @@ async function buyDCA(assetId, eur, planId = "principal", planNome = "Principal"
   totalInvested += eur;
   simBalance = +(simBalance - eur).toFixed(2);
   await fb.saveBalance("server", simBalance);
+  logEvent("buy", `🎯 DCA ${planNome}: comprou €${eur.toFixed(2)} de ${assetId.toUpperCase()} @ $${fillPrice < 1 ? fillPrice.toFixed(4) : fillPrice.toFixed(2)}`);
   return { fillPrice, units: novasUnits };
 }
 
@@ -1855,6 +1882,7 @@ async function init() {
   const TICK_MS = parseInt(process.env.SIM_TICK_MS || "30000"); // 30s por defeito
   setInterval(tick, TICK_MS);
   logger.info(`Motor iniciado — tick cada ${TICK_MS / 1000}s ✓`);
+  logEvent("info", `🤖 Bot arrancou — modo ${broker.getMode()}, tick a cada ${TICK_MS / 1000}s`);
 
   // Primeiro tick imediato
   await tick();
@@ -1943,6 +1971,36 @@ async function processCommands(currentPrices) {
         if (valorPlano < 1) { await fb.markCommand(cmd.id, "FALHOU", "valor do plano inválido"); continue; }
         const r = await dcaEngine.iniciarPlanoAgora(cmd.planId, valorPlano);
         await fb.markCommand(cmd.id, r.ok ? "FEITO" : "FALHOU", r.ok ? "plano iniciado" : r.reason);
+      } else if (cmd.type === "POS_VENDER_LUCRO" && cmd.posId) {
+        // Ativa/desativa "só vender com lucro" numa posição específica, com alvo %.
+        const pos = openPositions[cmd.posId];
+        if (pos) {
+          if (cmd.ativar && Number(cmd.lucroAlvo) > 0) {
+            pos.aiGerido = true; pos.lucroAlvo = Number(cmd.lucroAlvo);
+            await fb.saveTrade("server", pos).catch(() => {});
+            await fb.markCommand(cmd.id, "FEITO", `${pos.assetSym || pos.assetId}: vende a +${cmd.lucroAlvo}%`);
+          } else {
+            pos.aiGerido = false; pos.lucroAlvo = 0;
+            await fb.saveTrade("server", pos).catch(() => {});
+            await fb.markCommand(cmd.id, "FEITO", `${pos.assetSym || pos.assetId}: modo lucro desligado`);
+          }
+        } else {
+          await fb.markCommand(cmd.id, "FALHOU", "posição não encontrada");
+        }
+      } else if (cmd.type === "DCA_TO_AI" && cmd.planId && cmd.lucroAlvo) {
+        // Passa as posições de um plano para o AI Brain gerir: marca-as com
+        // aiGerido + lucroAlvo. Só serão vendidas quando em lucro (líquido).
+        const alvo = Number(cmd.lucroAlvo);
+        let n = 0;
+        for (const pos of Object.values(openPositions)) {
+          if (pos.stratId === "dca" && (pos.planId || "principal") === cmd.planId && (pos.status === "ABERTA" || !pos.status)) {
+            pos.aiGerido = true; pos.lucroAlvo = alvo;
+            await fb.saveTrade("server", pos).catch(() => {});
+            n++;
+          }
+        }
+        logger.info(`🤖 ${n} posições do plano passadas para o AI Brain gerir (lucro-alvo ${alvo}%)`);
+        await fb.markCommand(cmd.id, "FEITO", `${n} posições agora geridas pelo AI (alvo ${alvo}%)`);
       } else if (cmd.type === "RESET_ALL") {
         // Recomeço de raiz: apaga trades/arquivos/stats/logs e repõe o saldo.
         // Limpa também o estado em memória para o bot recomeçar limpo sem reiniciar.
