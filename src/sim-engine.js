@@ -1046,7 +1046,9 @@ function dcaPosicoes() {
 
 async function buyDCA(assetId, eur, planId = "principal", planNome = "Principal") {
   if (!prices.isReal(assetId)) throw new Error("sem preço real fresco");
-  const price = currentPrices[assetId]?.price;
+  // Buscar o preço diretamente da fonte (não depender de currentPrices do tick,
+  // que não existe quando buyDCA é chamado a partir de um comando como DCA_INICIAR).
+  const price = prices.getAll()[assetId]?.price;
   if (!price) throw new Error("sem preço atual");
   if (simBalance < eur) throw new Error(`saldo insuficiente (€${simBalance} < €${eur})`);
 
@@ -1089,7 +1091,7 @@ async function sellDCA(assetId, eur, planId = "principal") {
   const pos = Object.values(openPositions).find(p => p.stratId === "dca" && p.assetId === assetId && (p.planId || "principal") === planId);
   if (!pos) throw new Error("sem posição DCA neste ativo/plano");
   if (!prices.isReal(assetId)) throw new Error("sem preço real fresco");
-  const price = currentPrices[assetId]?.price;
+  const price = prices.getAll()[assetId]?.price;
   if (!price) throw new Error("sem preço atual");
 
   const valorAtual = pos.units * price;
@@ -1121,7 +1123,7 @@ function initDCA() {
     settings:     () => appSettings,
     dcaPositions: dcaPosicoes,
     dcaBalance:   dcaSaldoDisponivel,
-    priceOf:      (id) => (prices.isReal(id) ? (currentPrices[id]?.price ?? null) : null),
+    priceOf:      (id) => (prices.isReal(id) ? (prices.getAll()[id]?.price ?? null) : null),
     buyDCA, sellDCA,
     now: () => Date.now(),
     // Notifica o utilizador (Telegram) — usado para avisar de compras manuais.
